@@ -23,7 +23,7 @@ from global_var import count
 __all__ = ['convert_kvcache_llama_heavy_recent', 'LlamaAttention_heavy_hitter']
 
 # 核心代码：生成一个掩码，该掩码标识在注意力权重矩阵中哪些位置是“重击手”（H2）
-def local_heavy_hitter_mask(attn_weights, heavy_budget):
+def local_heavy_hitter_mask(attn_weights, heavy_budget, count):
     """动态生成局部重要注意力位置的掩码（滑动窗口策略）
     Args:
         attn_weights: 原始注意力权重矩阵 [batch_size, num_heads, seq_len, seq_len]
@@ -32,9 +32,11 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget):
         mask_bottom: 布尔掩码矩阵，True表示需要保留的位置
     """
 
+    print(4)
     # attn_weights (BS, head, query, keys)
     dtype_attn_weights = attn_weights.dtype # 保留原始张量的数据类型
     seq_length = attn_weights.shape[-1] # 获取序列长度
+    print(seq_length)
     padding_length = 0  # 从0开始，没变过
 
     # 使用softmax归一化得到概率分布
@@ -55,8 +57,8 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget):
     mask_bottom[:,:, padding_length:heavy_budget+padding_length, padding_length:heavy_budget+padding_length] = True
 
     # 动态调整掩码：逐token选择重要位置
+    # for token_index in range(0, heavy_budget):
     for token_index in range(heavy_budget+padding_length, seq_length):
-
         # 计算当前 token 的注意力权重
         tmp_attn_index = nn.functional.softmax(attn_weights[:,:,token_index,:], dim=-1, dtype=torch.float32).to(dtype_attn_weights)
         
@@ -68,7 +70,8 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget):
         
         # 就在这里改动，强制保留首个token
         # mask_bottom_index[:, :, 0] = True  # 所有head和batch的key位置0
-        # mask_bottom_index[:, :, 0:4] = True
+        mask_bottom_index[:, :, :4] = True
+        # mask_bottom_index[:, :, :] = True
         
         mask_bottom_index[:,:, token_index] = True
 
@@ -90,7 +93,7 @@ def plot_and_save_matrix(matrix, layer_idx, filename, title="Matrix"):
     """
     # assert matrix.shape[0] == matrix.shape[1], "矩阵必须是方阵"
 
-    filename = f"./images/layer{layer_idx}_{filename}"
+    filename = f"/home/ubuntu/data/h2o_images/layer{layer_idx}_{filename}"
     title = f"{title} (Layer {layer_idx})"
     
     # 确保张量在CPU上
@@ -108,7 +111,7 @@ def plot_and_save_matrix(matrix, layer_idx, filename, title="Matrix"):
 
 class LlamaAttention_heavy_hitter(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
-    count = 0
+    # count = 0
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
@@ -154,7 +157,10 @@ class LlamaAttention_heavy_hitter(nn.Module):
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         
-        # global count
+        print(3)
+        print("hello world")
+
+        global count
         count += 1
         self.layer_idx = count
         # self.layer_idx += 1
@@ -165,22 +171,71 @@ class LlamaAttention_heavy_hitter(nn.Module):
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 应用旋转位置编码
+        # 修改位置编码部分
+        if past_key_value is not None:
+            # 计算实际缓存长度
+            cache_len = past_key_value[0].shape[-2] if past_key_value[0] is not None else 0
+            
+            # 生成相对位置ID（从缓存末尾开始）
+            position_ids = torch.arange(
+                start=cache_len,
+                end=cache_len + key_states.shape[-2],
+                device=key_states.device
+            ).unsqueeze(0)  # (1, seq_len)
+        
+        # 调整旋转位置编码的生成
         kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        # [bsz, nh, t, hd]
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len + (past_key_value[0].shape[-2] if past_key_value else 0))
+        
+        # 应用位置编码，根据缓存长度处理
+        if past_key_value is not None and past_key_value[0].shape[-2] > 0:
+            # 分离历史缓存和新token的位置编码
+            past_cache_len = past_key_value[0].shape[-2]
+            
+            # 历史缓存使用相对位置 [0, 1, ..., past_cache_len-1]
+            # 新token使用相对位置 [past_cache_len, ..., past_cache_len + q_len -1]
+            query_states = apply_rotary_pos_emb(
+                query_states,
+                cos[:, past_cache_len:],
+                sin[:, past_cache_len:],
+                position_ids
+            )
+            key_states = torch.cat([
+                apply_rotary_pos_emb(
+                    past_key_value[0],
+                    cos[:, :past_cache_len],
+                    sin[:, :past_cache_len],
+                    torch.arange(past_cache_len, device=key_states.device).unsqueeze(0)
+                ),
+                apply_rotary_pos_emb(
+                    key_states,
+                    cos[:, past_cache_len:],
+                    sin[:, past_cache_len:],
+                    position_ids
+                )
+            ], dim=2)
+        else:
+            # 无缓存时的原始处理
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids)
 
-        # 合并历史KV缓存（与原始Llama一致）
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        # # 应用旋转位置编码
+        # kv_seq_len = key_states.shape[-2]
+        # if past_key_value is not None:
+        #     kv_seq_len += past_key_value[0].shape[-2]
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # # [bsz, nh, t, hd]
+
+        # # 合并历史KV缓存（与原始Llama一致）
+        # if past_key_value is not None:
+        #     # reuse k, v, self_attention
+        #     key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        #     value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
 
+        # 这里需要修改编码位置
         # 计算原始注意力分数
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         # 对第二个维度求和，绘制出来
@@ -211,7 +266,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
 
         # Heavy Hitter Mask (Based on local statistics)
         if heavy_budget > 0:
-            mask_bottom = local_heavy_hitter_mask(attn_weights, heavy_budget) # Default: No padding applied to input
+            mask_bottom = local_heavy_hitter_mask(attn_weights, heavy_budget, count) # Default: No padding applied to input
         else:
             mask_bottom = torch.zeros_like(attn_weights, dtype=torch.bool)
 
@@ -225,10 +280,10 @@ class LlamaAttention_heavy_hitter(nn.Module):
         attn_weights[~mask_bottom] = torch.min(attention_mask)
         # 对第二个维度求和，绘制出来
         sum_attn_weights_2 = torch.sum(attn_weights, dim=1)
-        # plot_and_save_matrix(sum_attn_weights_2[0], self.layer_idx, "masked_softmax_attn.png", title="test_plot_attn")
-        sum_attn_weights_2 = nn.functional.softmax(sum_attn_weights_2[0], 
+        plot_and_save_matrix(sum_attn_weights_2[0], self.layer_idx, "masked_softmax_attn.png", title="test_plot_attn")
+        sum_attn_weights_2 = nn.functional.softmax(sum_attn_weights_2, 
                                                 dim=-1, dtype=torch.float32).to(sum_attn_weights_2.dtype)
-        plot_and_save_matrix(sum_attn_weights_2, self.layer_idx, "masked_attn.png", title="test_plot_attn")
+        plot_and_save_matrix(sum_attn_weights_2[0], self.layer_idx, "masked_attn.png", title="test_plot_attn")
         
         # # Heavy Hitter Mask (Based on global statistics)
         # # 全局统计法（当前实际使用的方法）x
@@ -251,13 +306,13 @@ class LlamaAttention_heavy_hitter(nn.Module):
         # # mask_bottom = ones
         # attn_weights[~mask_bottom] = torch.finfo(attn_weights.dtype).min
 
-        # 更改
-        if output_attentions:
-            # 保存原始注意力分数（未归一化）
-            raw_attn = attn_weights.clone()
-            raw_attn[~mask_bottom] = torch.finfo(raw_attn.dtype).min
-            # 对第二个维度求和
-            self.head_summed_attention = raw_attn.sum(dim=1)  # (batch, q_len, k_len)
+        # # 更改
+        # if output_attentions:
+        #     # 保存原始注意力分数（未归一化）
+        #     raw_attn = attn_weights.clone()
+        #     raw_attn[~mask_bottom] = torch.finfo(raw_attn.dtype).min
+        #     # 对第二个维度求和
+        #     self.head_summed_attention = raw_attn.sum(dim=1)  # (batch, q_len, k_len)
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
