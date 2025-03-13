@@ -195,14 +195,6 @@ class LlamaConfig(PretrainedConfig):
 
 
 
-
-
-
-
-
-
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -502,9 +494,7 @@ class H2OLlamaAttention(nn.Module):
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-            query_states.dtype
-        )
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
         past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
 

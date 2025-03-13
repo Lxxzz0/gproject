@@ -26,9 +26,13 @@ class TorchCompressedDevice:
         self.device_type = DeviceType.COMPRESSED
         self.base_device = base_device
 
+        # 管理解压缩时的工作空间
         self.data_decompress_workspace = None
         self.workspace_pt = 0
 
+    # 计算填充后的数据形状，确保是组大小的整数倍
+    # 创建压缩数据(data)和缩放因子(scale)张量
+    # data使用uint8存储打包的4位数据，scale使用float16存储每组的缩放和最小值
     def allocate(self, shape, dtype, comp_config, pin_memory=None, name=None):
         """Allocate a compressed TorchTensor. Round up the shape to group boundary."""
         assert comp_config.num_bits == 4 and dtype == np.float16
@@ -36,9 +40,17 @@ class TorchCompressedDevice:
         group_size, group_dim = comp_config.group_size, comp_config.group_dim
 
         # Round up
+        # 计算组数。要向上取整，所以加了 group_size - 1
         num_groups = (shape[group_dim] + group_size - 1) // group_size
+        # 压缩数据的形状。在对应维度上，维度大小变为原来的一半，其余维度不变
         data_shape = (
             shape[:group_dim] + (num_groups * (group_size // 2),) + shape[group_dim+1:])
+        
+        # 想改为8bit量化
+        # data_shape = (
+        #     shape[:group_dim] + (num_groups * group_size,) + shape[group_dim+1:])
+
+        # 压缩因子的形状。中间每组两个值，一个是缩放因子，一个是最小值
         scale_shape = (
             shape[:group_dim] + (num_groups, 2) + shape[group_dim+1:])
 
@@ -48,6 +60,8 @@ class TorchCompressedDevice:
         return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
                            (data, scale, comp_config), self, name=name)
 
+    # 初始化 GPU 批处理缓存
+    # 分配 k_cache 和 v_cache，用于存储键和值的缓存
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
@@ -61,6 +75,8 @@ class TorchCompressedDevice:
             comp_config=policy.comp_cache_config, pin_memory=pin_memory)
         return k_cache, v_cache
 
+    # 初始化注意力计算工作空间，仅在 CPU 上需要。
+    # 分配两个浮点型工作空间，用于解压缩数据
     def init_attention_compute_workspace(self, config, task, policy):
         if self.base_device.device_type != DeviceType.CPU:
             return  # Only CPU requires this fp32 workspace
@@ -84,6 +100,7 @@ class TorchCompressedDevice:
                 device=self.base_device.dev),
         ]
 
+    # 压缩。量化和打包
     def compress(self, tensor, comp_config):
         """Compress a torch.Tensor. Round up the shape to group boundary."""
         group_size, num_bits, group_dim, symmetric = (
@@ -98,6 +115,7 @@ class TorchCompressedDevice:
         num_groups = (shape[group_dim] + group_size - 1) // group_size
 
         # Pad
+        # 重塑为 [..., 组数量, 组大小, ...]
         new_shape = (shape[:group_dim] + (num_groups, group_size) +
                      shape[group_dim+1:])
         pad_len = (group_size - shape[group_dim] % group_size) % group_size
@@ -120,12 +138,14 @@ class TorchCompressedDevice:
         data = data.clamp_(0, B).round_().to(torch.uint8)
 
         # Pack
+        # 获取偶数和奇数索引
         left_indices = (
             tuple(slice(0, x) for x in data.shape[:group_dim+1]) +
             (slice(0, data.shape[group_dim+1], 2),))
         right_indices = (
             tuple(slice(0, x) for x in data.shape[:group_dim+1]) +
             (slice(1, data.shape[group_dim+1], 2),))
+        # 合并
         data = torch.bitwise_or(
             data[left_indices].bitwise_left_shift(4), data[right_indices])
 
@@ -143,6 +163,7 @@ class TorchCompressedDevice:
         return TorchTensor(shape, tensor.dtype,
                            (data, scale, comp_config), self)
 
+    # 解压缩。还原
     def decompress(self, tensor):
         data, scale, comp_config = tensor.data
         group_size, num_bits, group_dim, symmetric = (

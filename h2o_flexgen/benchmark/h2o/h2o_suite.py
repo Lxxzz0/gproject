@@ -29,7 +29,7 @@ suite_flexgen = [
 
 
 suite_h2o_20 = [
-    # H2O
+    # H2O，无量化
     # opt-6.7b
     Case("--model facebook/opt-6.7b --path _DUMMY_ --percent 100 0 100 0 100 0 --overlap False --gpu-batch-size 4 --prompt-len 512 --gen-len 32 --cut-gen-len 8 --hh-ratio 0.1 --hh-all"),
     Case("--model facebook/opt-6.7b --path _DUMMY_ --percent 100 0 100 0 100 0 --overlap False --gpu-batch-size 4 --prompt-len 512 --gen-len 512 --cut-gen-len 128 --hh-ratio 0.2 --hh-all"),
@@ -40,7 +40,7 @@ suite_h2o_20 = [
     Case("--model facebook/opt-30b --path _DUMMY_ --percent 0 100 0 100 0 100 --gpu-batch-size 52 --num-gpu-batches 8 --cpu --prompt-len 512 --gen-len 512 --debug fewer_batch --hh-ratio 0.2 --hh-all"),
     Case("--model facebook/opt-30b --path _DUMMY_ --percent 0 100 0 100 0 100 --gpu-batch-size 44 --num-gpu-batches 6 --cpu --prompt-len 512 --gen-len 1024 --debug fewer_batch --hh-ratio 0.3 --hh-all"),
 
-    # H2O weights compress
+    # H2O weights compress，量化
     # opt-6.7b
     Case("--model facebook/opt-6.7b --path _DUMMY_ --percent 100 0 100 0 100 0 --overlap False --gpu-batch-size 70 --prompt-len 512 --gen-len 32 --hh-ratio 0.1 --hh-all --compress-weight"),
     Case("--model facebook/opt-6.7b --path _DUMMY_ --percent 100 0 100 0 100 0 --overlap False --gpu-batch-size 52 --prompt-len 512 --gen-len 512 --cut-gen-len 128 --hh-ratio 0.2 --hh-all --compress-weight"),
