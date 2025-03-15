@@ -32,9 +32,10 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget):
         mask_bottom: 布尔掩码矩阵，True表示需要保留的位置
     """
 
+    pdb.set_trace()
     # attn_weights (BS, head, query, keys)
     dtype_attn_weights = attn_weights.dtype # 保留原始张量的数据类型
-    seq_length = attn_weights.shape[-1] # 获取序列长度
+    seq_length = attn_weights.shape[-2] # 获取序列长度
     padding_length = 0
 
     # 使用softmax归一化得到概率分布
@@ -55,9 +56,13 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget):
     # query和key的维度都要保留前heavy_budget个位置
     mask_bottom[:,:, padding_length:heavy_budget+padding_length, padding_length:heavy_budget+padding_length] = True
 
+    max_valid_index = accumulated_attention_score.shape[-1] - 1
+    for token_index in range(heavy_budget + padding_length, seq_length):
+        if token_index > max_valid_index:
+            break
     # 动态调整掩码：逐token选择重要位置
     # 这里的掩码会保留key的绝对位置，每个token都保留最重要的k个key的位置
-    for token_index in range(heavy_budget+padding_length, seq_length):
+    # for token_index in range(heavy_budget+padding_length, seq_length):
         # 计算当前 token 的注意力权重
         tmp_attn_index = nn.functional.softmax(attn_weights[:,:,token_index,:], dim=-1, dtype=torch.float32).to(dtype_attn_weights)
         
@@ -171,13 +176,13 @@ class H2OKVCache_LayerWise:
         keep_topk = keep_topk.sort().values
 
         # keep_recent = torch.arange(seq_len - self.recent_size, seq_len).expand(keep_topk.shape[0], 1).to(keep_topk.device)
-        keep_first = torch.arange(2, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
+        # keep_first = torch.arange(2, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
         keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
-        keep_idx = torch.cat([keep_first, keep_topk, keep_recent], dim=-1)
+        # keep_idx = torch.cat([keep_first, keep_topk, keep_recent], dim=-1)
+        keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
 
         mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
         mask = mask.scatter(-1, keep_idx, 1)
-        mask[:] = 1
 
         k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
         v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
@@ -367,6 +372,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
         # self.layer_idx += 1
         # use_cache = True
         
+        # pdb.set_trace()
         # 原始投影操作（与Llama一致）
         bsz, q_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -412,6 +418,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
         #     key_states = torch.cat([past_key, key_states], dim=2)
         #     value_states = torch.cat([past_value, value_states], dim=2)
 
+        pdb.set_trace()
         # 修改编码位置
         # 计算原始注意力分数
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -422,11 +429,31 @@ class LlamaAttention_heavy_hitter(nn.Module):
         # if (count < 32):
         #     plot_and_save_matrix(sum_attn_weights_1[0], self.layer_idx, "origin_softmax_attn.png", title="test_plot_attn")
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
+        # 在计算 attn_weights 前生成动态因果掩码
+        if attention_mask is not None:
+            # 扩展掩码形状到 [batch_size, 1, q_len, kv_seq_len]
+            attention_mask = attention_mask.expand(bsz, 1, q_len, -1)
+            
+            # 如果掩码长度不足，动态填充
+            if attention_mask.shape[-1] < kv_seq_len:
+                pad_len = kv_seq_len - attention_mask.shape[-1]
+                attention_mask = torch.cat([
+                    attention_mask,
+                    torch.zeros((bsz, 1, q_len, pad_len), device=attention_mask.device)
+                ], dim=-1)
+            
+            # 应用因果掩码（仅遮挡未来位置）
+            causal_mask = torch.triu(
+                torch.ones((q_len, kv_seq_len), dtype=torch.bool, device=hidden_states.device),
+                diagonal=1
             )
+            attention_mask = attention_mask.masked_fill(causal_mask, float("-inf"))
+
+            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
+                )
 
         # 应用注意力掩码（因果掩码等）
         if attention_mask is not None:
@@ -439,8 +466,8 @@ class LlamaAttention_heavy_hitter(nn.Module):
 
         # 计算稀疏化预算（动态调整）
         ### Heavy + Recent
-        heavy_budget = int(self.heavy_budget_ratio * attn_weights.shape[-1])
-        recent_budget = int(self.recent_budget_ratio * attn_weights.shape[-1])
+        heavy_budget = int(self.heavy_budget_ratio * attn_weights.shape[-2])
+        recent_budget = int(self.recent_budget_ratio * attn_weights.shape[-2])
 
         # Heavy Hitter Mask (Based on local statistics)
         if heavy_budget > 0:
@@ -468,7 +495,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
         # 添加到past_kv_cache
-        pdb.set_trace()
+        # pdb.set_trace()
         past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
 
         # 稀疏矩阵乘法计算注意力输出
