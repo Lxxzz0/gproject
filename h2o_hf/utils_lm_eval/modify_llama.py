@@ -18,12 +18,12 @@ from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, Llama
 from transformers.configuration_utils import PretrainedConfig
 
 import matplotlib.pyplot as plt
-from global_var import count
+# from global_var import count
 
 __all__ = ['convert_kvcache_llama_heavy_recent', 'LlamaAttention_heavy_hitter']
 
 # 核心代码：生成一个掩码，该掩码标识在注意力权重矩阵中哪些位置是“重击手”（H2）
-def local_heavy_hitter_mask(attn_weights, heavy_budget, count):
+def local_heavy_hitter_mask(attn_weights, heavy_budget):
     """动态生成局部重要注意力位置的掩码（滑动窗口策略）
     Args:
         attn_weights: 原始注意力权重矩阵 [batch_size, num_heads, seq_len, seq_len]
@@ -41,6 +41,7 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget, count):
     # 获取当前数据类型的最小值（用于后续掩码）
     offset = torch.finfo(attn_weights.dtype).min
     # 计算注意力权重的 softmax
+    # 对key做softmax，后面再求和，得到每个键在整个查询序列的重要性
     tmp_attn = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype_attn_weights)
 
     # 累积注意力分数（滑动窗口统计）
@@ -55,7 +56,7 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget, count):
     mask_bottom[:,:, padding_length:heavy_budget+padding_length, padding_length:heavy_budget+padding_length] = True
 
     # 动态调整掩码：逐token选择重要位置
-    # for token_index in range(0, heavy_budget):
+    # 这里的掩码会保留key的绝对位置，每个token都保留最重要的k个key的位置
     for token_index in range(heavy_budget+padding_length, seq_length):
         # 计算当前 token 的注意力权重
         tmp_attn_index = nn.functional.softmax(attn_weights[:,:,token_index,:], dim=-1, dtype=torch.float32).to(dtype_attn_weights)
@@ -66,10 +67,9 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget, count):
         # 更新掩码
         mask_bottom_index = zeros_index.scatter(-1, tmp_topk_index, True) #(head, keys)
         
-        # 就在这里改动，强制保留首个token
+        # 就在这里改动，强制保留首个token。错了，这是保留每个token的前几个key的位置
         # mask_bottom_index[:, :, 0] = True  # 所有head和batch的key位置0
-        mask_bottom_index[:, :, :4] = True
-        # mask_bottom_index[:, :, :] = True
+        # mask_bottom_index[:, :, :4] = True
         
         mask_bottom_index[:,:, token_index] = True
 
@@ -154,6 +154,7 @@ class H2OKVCache_LayerWise:
 
     def __call__(self, past_key_values, attn_score_cache):
 
+        # pdb.set_trace()
         self._update_hh_score(attn_score_cache)
 
         if past_key_values is None:
@@ -170,39 +171,13 @@ class H2OKVCache_LayerWise:
         keep_topk = keep_topk.sort().values
 
         # keep_recent = torch.arange(seq_len - self.recent_size, seq_len).expand(keep_topk.shape[0], 1).to(keep_topk.device)
+        keep_first = torch.arange(2, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
         keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
-        keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
+        keep_idx = torch.cat([keep_first, keep_topk, keep_recent], dim=-1)
 
         mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
         mask = mask.scatter(-1, keep_idx, 1)
-
-        k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-        v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-
-        self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
-
-        return (k_hh_recent, v_hh_recent)
-
-    def evict_for_space(self, past_key_values, num_coming):
-        if past_key_values is None:
-            return None
-        seq_len = past_key_values[0][0].size(self.k_seq_dim)
-        if seq_len + num_coming <= self.cache_size:
-            return past_key_values
-
-        # hh-selection
-        bsz, num_heads, _, head_dim = past_key_values[0].shape
-
-        select_hh_scores = self.hh_score[:, :seq_len - self.recent_size + num_coming]
-        _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
-        keep_topk = keep_topk.sort().values
-
-        # keep_recent = torch.arange(seq_len - self.recent_size, seq_len).expand(keep_topk.shape[0], 1).to(keep_topk.device)
-        keep_recent = torch.arange(seq_len - self.recent_size + num_coming, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
-        keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
-
-        mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
-        mask = mask.scatter(-1, keep_idx, 1)
+        mask[:] = 1
 
         k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
         v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
@@ -213,7 +188,7 @@ class H2OKVCache_LayerWise:
 
     def _update_hh_score(self, attn_score_cache):
 
-        num_new_tokens = attn_score_cache.shape[2]
+        num_new_tokens = max(attn_score_cache.shape[2], 97)
 
         if self.hh_score is None:
             self.hh_score = attn_score_cache.sum(0).sum(1)
@@ -223,93 +198,25 @@ class H2OKVCache_LayerWise:
             attn_score_cache[:, :-num_new_tokens] += self.hh_score
             self.hh_score = attn_score_cache
 
+    # def _update_hh_score(self, attn_score_cache):
+    #     num_new_tokens = attn_score_cache.shape[2]
+    #     temp_hh_score = []
+    #     if self.hh_score is None:
+    #         for i in range(0, len(attn_score_cache)):
+    #             temp_hh_score.append(attn_score_cache[i].sum(1))
+    #         self.hh_score = temp_hh_score
+    #     else:
+    #         for i in range(0, len(attn_score_cache)):
+    #             temp_score_cache = attn_score_cache[i].sum(1)
+    #             temp_score_cache[:, :-num_new_tokens] += self.hh_score[i]
+    #             self.hh_score[i] = temp_score_cache
+
     def _clean_scores(self):
         self.hh_score = None
 
 
 class LlamaConfig(PretrainedConfig):
-    r"""
-    This is the configuration class to store the configuration of a [`LlamaModel`]. It is used to instantiate an LLaMA
-    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the LLaMA-7B.
-
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
-
-
-    Args:
-        vocab_size (`int`, *optional*, defaults to 32000):
-            Vocabulary size of the LLaMA model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`LlamaModel`]
-        hidden_size (`int`, *optional*, defaults to 4096):
-            Dimension of the hidden representations.
-        intermediate_size (`int`, *optional*, defaults to 11008):
-            Dimension of the MLP representations.
-        num_hidden_layers (`int`, *optional*, defaults to 32):
-            Number of hidden layers in the Transformer decoder.
-        num_attention_heads (`int`, *optional*, defaults to 32):
-            Number of attention heads for each attention layer in the Transformer decoder.
-        num_key_value_heads (`int`, *optional*):
-            This is the number of key_value heads that should be used to implement Grouped Query Attention. If
-            `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
-            `num_key_value_heads=1 the model will use Multi Query Attention (MQA) otherwise GQA is used. When
-            converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
-            by meanpooling all the original heads within that group. For more details checkout [this
-            paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
-            `num_attention_heads`.
-        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
-            The non-linear activation function (function or string) in the decoder.
-        max_position_embeddings (`int`, *optional*, defaults to 2048):
-            The maximum sequence length that this model might ever be used with. Llama 1 supports up to 2048 tokens,
-            Llama 2 up to 4096, CodeLlama up to 16384.
-        initializer_range (`float`, *optional*, defaults to 0.02):
-            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
-            The epsilon used by the rms normalization layers.
-        use_cache (`bool`, *optional*, defaults to `True`):
-            Whether or not the model should return the last key/values attentions (not used by all models). Only
-            relevant if `config.is_decoder=True`.
-        pad_token_id (`int`, *optional*):
-            Padding token id.
-        bos_token_id (`int`, *optional*, defaults to 1):
-            Beginning of stream token id.
-        eos_token_id (`int`, *optional*, defaults to 2):
-            End of stream token id.
-        pretraining_tp (`int`, *optional*, defaults to 1):
-            Experimental feature. Tensor parallelism rank used during pretraining. Please refer to [this
-            document](https://huggingface.co/docs/transformers/parallelism) to understand more about it. This value is
-            necessary to ensure exact reproducibility of the pretraining results. Please refer to [this
-            issue](https://github.com/pytorch/pytorch/issues/76232).
-        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-            Whether to tie weight embeddings
-        rope_theta (`float`, *optional*, defaults to 10000.0):
-            The base period of the RoPE embeddings.
-        rope_scaling (`Dict`, *optional*):
-            Dictionary containing the scaling configuration for the RoPE embeddings. Currently supports two scaling
-            strategies: linear and dynamic. Their scaling factor must be a float greater than 1. The expected format is
-            `{"type": strategy name, "factor": scaling factor}`. When using this flag, don't update
-            `max_position_embeddings` to the expected new maximum. See the following thread for more information on how
-            these scaling strategies behave:
-            https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/. This is an
-            experimental feature, subject to breaking API changes in future versions.
-        attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
-            Whether to use a bias in the query, key, value and output projection layers during self-attention.
-        attention_dropout (`float`, *optional*, defaults to 0.0):
-            The dropout ratio for the attention probabilities.
-
-    ```python
-    >>> from transformers import LlamaModel, LlamaConfig
-
-    >>> # Initializing a LLaMA llama-7b style configuration
-    >>> configuration = LlamaConfig()
-
-    >>> # Initializing a model from the llama-7b style configuration
-    >>> model = LlamaModel(configuration)
-
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-    ```"""
-
+    
     model_type = "llama"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -335,6 +242,10 @@ class LlamaConfig(PretrainedConfig):
         rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
+        hh_size=4,          # Heavy Hitter保留的token数量
+        recent_size=512,    # Recent保留的token数量
+        heavy_ratio=0.1,    # Heavy预算比例
+        recent_ratio=0.1,   # Recent预算比例
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -343,6 +254,10 @@ class LlamaConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
+        self.hh_size = hh_size
+        self.recent_size = recent_size
+        self.heavy_ratio = heavy_ratio
+        self.recent_ratio = recent_ratio
 
         # for backward compatibility
         if num_key_value_heads is None:
@@ -429,9 +344,158 @@ class LlamaAttention_heavy_hitter(nn.Module):
         self.kv_cache = H2OKVCache_LayerWise(
             # hh_size=config.hh_size,
             # recent_size=config.recent_size,
+            hh_size=4,
+            recent_size=512,
             k_seq_dim=2,
             v_seq_dim=2,
         )
+
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        
+        # global count
+        # count += 1
+        # self.layer_idx = count
+        # self.layer_idx += 1
+        # use_cache = True
+        
+        # 原始投影操作（与Llama一致）
+        bsz, q_len, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+
+        position_length = kv_seq_len
+        if not position_ids.nelement() > 1:
+            if position_length < position_ids.item()+1:
+                position_length = position_ids.item()+1
+
+        cos, sin = self.rotary_emb(value_states, seq_len=position_length)
+        ### Shift Pos: query pos is min(cache_size, idx)
+        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
+        key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
+        ###
+
+        if past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+        past_key_value = (key_states, value_states) if use_cache else None
+
+        ### Shift Pos: key pos is the pos in cache (Rolling KV Cache and using relative pos emb)
+        key_position_ids = torch.arange(kv_seq_len, device=position_ids.device).unsqueeze(0)
+        key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
+        ###
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # # 修改部分：处理带量化的KV Cache
+        # if past_key_value is not None:
+        #     # 解量化历史KV
+        #     past_key, past_value = self.decompress_kv(past_key_value)
+        #     key_states = torch.cat([past_key, key_states], dim=2)
+        #     value_states = torch.cat([past_value, value_states], dim=2)
+
+        # 修改编码位置
+        # 计算原始注意力分数
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # # 对第二个维度求和，绘制出来
+        # sum_attn_weights_1 = torch.sum(attn_weights, dim=1)
+        # # plot_and_save_matrix(sum_attn_weights_1[0], self.layer_idx, "origin_attn.png", title="test_plot_attn")
+        # sum_attn_weights_1 = nn.functional.softmax(sum_attn_weights_1, dim=-1, dtype=torch.float32).to(sum_attn_weights_1.dtype)
+        # if (count < 32):
+        #     plot_and_save_matrix(sum_attn_weights_1[0], self.layer_idx, "origin_softmax_attn.png", title="test_plot_attn")
+
+        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+
+        # 应用注意力掩码（因果掩码等）
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+            # attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
+
+        # 计算稀疏化预算（动态调整）
+        ### Heavy + Recent
+        heavy_budget = int(self.heavy_budget_ratio * attn_weights.shape[-1])
+        recent_budget = int(self.recent_budget_ratio * attn_weights.shape[-1])
+
+        # Heavy Hitter Mask (Based on local statistics)
+        if heavy_budget > 0:
+            mask_bottom = local_heavy_hitter_mask(attn_weights, heavy_budget) # Default: No padding applied to input
+        else:
+            mask_bottom = torch.zeros_like(attn_weights, dtype=torch.bool)
+
+        ones = torch.ones_like(attn_weights, dtype=torch.bool)
+        ones = torch.triu(ones, diagonal=-recent_budget)
+        mask_bottom = torch.logical_or(mask_bottom, ones)
+        mask_bottom = torch.tril(mask_bottom, diagonal=0)
+
+        # mask_bottom = ones
+        attn_weights[~mask_bottom] = torch.min(attention_mask)
+
+        # 对第二个维度求和，绘制出来
+        # sum_attn_weights_2 = torch.sum(attn_weights, dim=1)
+        # # plot_and_save_matrix(sum_attn_weights_2[0], self.layer_idx, "masked_softmax_attn.png", title="test_plot_attn")
+        # sum_attn_weights_2 = nn.functional.softmax(sum_attn_weights_2, 
+        #                                         dim=-1, dtype=torch.float32).to(sum_attn_weights_2.dtype)
+        # if (count < 32):
+        #     plot_and_save_matrix(sum_attn_weights_2[0], self.layer_idx, "masked_softmax_attn.png", title="test_plot_attn")
+        
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        # 添加到past_kv_cache
+        pdb.set_trace()
+        past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
+
+        # 稀疏矩阵乘法计算注意力输出
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        # 输出形状调整（与原始Llama一致）
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        # # 保存量化后的KV Cache
+        # if use_cache:
+        #     past_key_value = self.compress_kv(key_states, value_states)
+        # else:
+        #     past_key_value = None
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
 
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -498,162 +562,6 @@ class LlamaAttention_heavy_hitter(nn.Module):
         key, value = compressed_kv
         return _dequant(key), _dequant(value)
 
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        
-        global count
-        count += 1
-        self.layer_idx = count
-        # self.layer_idx += 1
-        # use_cache = True
-        
-        # 原始投影操作（与Llama一致）
-        bsz, q_len, _ = hidden_states.size()
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # 应用旋转位置编码
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-
-        position_length = kv_seq_len
-        if not position_ids.nelement() > 1:
-            if position_length < position_ids.item()+1:
-                position_length = position_ids.item()+1
-
-        cos, sin = self.rotary_emb(value_states, seq_len=position_length)
-        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        # query_states, key_states = lx_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
-        key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
-        # [bsz, nh, t, hd]
-
-        # pdb.set_trace()
-
-        # 合并历史KV缓存（与原始Llama一致）
-        if past_key_value is not None:
-            if count < 32:
-                print("hello world")
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-        past_key_value = (key_states, value_states) if use_cache else None
-
-        # ### Shift Pos: key pos is the pos in cache
-        # key_position_ids = torch.arange(kv_seq_len, device=position_ids.device).unsqueeze(0)
-        # key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
-        # ###
-
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        # # 修改部分：处理带量化的KV Cache
-        # if past_key_value is not None:
-        #     # 解量化历史KV
-        #     past_key, past_value = self.decompress_kv(past_key_value)
-        #     key_states = torch.cat([past_key, key_states], dim=2)
-        #     value_states = torch.cat([past_value, value_states], dim=2)
-
-        # 修改编码位置
-        # 计算原始注意力分数
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        # # 对第二个维度求和，绘制出来
-        # sum_attn_weights_1 = torch.sum(attn_weights, dim=1)
-        # # plot_and_save_matrix(sum_attn_weights_1[0], self.layer_idx, "origin_attn.png", title="test_plot_attn")
-        # sum_attn_weights_1 = nn.functional.softmax(sum_attn_weights_1, dim=-1, dtype=torch.float32).to(sum_attn_weights_1.dtype)
-        # if (count < 32):
-        #     plot_and_save_matrix(sum_attn_weights_1[0], self.layer_idx, "origin_softmax_attn.png", title="test_plot_attn")
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        # 应用注意力掩码（因果掩码等）
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
-            # attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
-
-        # 计算稀疏化预算（动态调整）
-        ### Heavy + Recent
-        heavy_budget = int(self.heavy_budget_ratio * attn_weights.shape[-1])
-        recent_budget = int(self.recent_budget_ratio * attn_weights.shape[-1])
-
-        # Heavy Hitter Mask (Based on local statistics)
-        if heavy_budget > 0:
-            mask_bottom = local_heavy_hitter_mask(attn_weights, heavy_budget, count) # Default: No padding applied to input
-        else:
-            mask_bottom = torch.zeros_like(attn_weights, dtype=torch.bool)
-
-        ones = torch.ones_like(attn_weights, dtype=torch.bool)
-        ones = torch.triu(ones, diagonal=-recent_budget)
-        mask_bottom = torch.logical_or(mask_bottom, ones)
-
-        mask_bottom = torch.tril(mask_bottom, diagonal=0)
-
-        # mask_bottom = ones
-        attn_weights[~mask_bottom] = torch.min(attention_mask)
-
-        # 根据掩码计算结果来修改kv_cache
-
-
-        # 对第二个维度求和，绘制出来
-        # sum_attn_weights_2 = torch.sum(attn_weights, dim=1)
-        # # plot_and_save_matrix(sum_attn_weights_2[0], self.layer_idx, "masked_softmax_attn.png", title="test_plot_attn")
-        # sum_attn_weights_2 = nn.functional.softmax(sum_attn_weights_2, 
-        #                                         dim=-1, dtype=torch.float32).to(sum_attn_weights_2.dtype)
-        # if (count < 32):
-        #     plot_and_save_matrix(sum_attn_weights_2[0], self.layer_idx, "masked_softmax_attn.png", title="test_plot_attn")
-        
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-        # 添加到past_kv_cache
-        # pdb.set_trace()
-        past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
-
-        # 稀疏矩阵乘法计算注意力输出
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        # 输出形状调整（与原始Llama一致）
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        attn_output = self.o_proj(attn_output)
-
-        # # 保存量化后的KV Cache
-        # if use_cache:
-        #     past_key_value = self.compress_kv(key_states, value_states)
-        # else:
-        #     past_key_value = None
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
 
 
 def convert_kvcache_llama_heavy_recent(model, config):
