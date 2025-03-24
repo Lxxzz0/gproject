@@ -69,6 +69,7 @@ OPT_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
+# 生成因果注意力掩码
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
     """
     Make causal mask used for bi-directional self-attention.
@@ -84,6 +85,7 @@ def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 
 
+# 扩展并转换注意力掩码格式
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
@@ -98,6 +100,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
+# 可学习的位置嵌入层
 class OPTLearnedPositionalEmbedding(nn.Embedding):
     """
     This module learns positional embeddings up to a fixed maximum size.
@@ -122,6 +125,7 @@ class OPTLearnedPositionalEmbedding(nn.Embedding):
         return super().forward(positions + self.offset)
 
 
+# 实现了OPT的改进版多头注意力
 class OPTAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -280,6 +284,7 @@ class OPTAttention(nn.Module):
         return attn_output, attn_weights_reshaped, past_key_value
 
 
+# 解码层结构
 class OPTDecoderLayer(nn.Module):
     def __init__(self, config: OPTConfig):
         super().__init__()
@@ -398,6 +403,8 @@ OPT_START_DOCSTRING = r"""
     "The bare OPT Model outputting raw hidden-states without any specific head on top.",
     OPT_START_DOCSTRING,
 )
+
+# 所有OPT模型的抽象基类，提供from_pretrained()方法加载预训练权重，实现模型配置管理，定义通用初始化方法
 class OPTPreTrainedModel(PreTrainedModel):
 
     config_class = OPTConfig
@@ -484,6 +491,7 @@ OPT_INPUTS_DOCSTRING = r"""
 """
 
 
+# 解码层
 class OPTDecoder(OPTPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`OPTDecoderLayer`]
@@ -665,6 +673,7 @@ class OPTDecoder(OPTPreTrainedModel):
                         f" {head_mask.size()[0]}."
                     )
 
+        # 开始遍历每层
         for idx, decoder_layer in enumerate(self.layers):
             from transformers.generation_utils import get_step
             global layer_id
@@ -746,6 +755,8 @@ class OPTDecoder(OPTPreTrainedModel):
     "The bare OPT Model outputting raw hidden-states without any specific head on top.",
     OPT_START_DOCSTRING,
 )
+
+# 完整的模型结构
 class OPTModel(OPTPreTrainedModel):
     def __init__(self, config: OPTConfig):
         super().__init__(config)
@@ -814,6 +825,7 @@ class OPTModel(OPTPreTrainedModel):
         )
 
 
+# 因果语言建模（文本生成）
 class OPTForCausalLM(OPTPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
 
@@ -998,6 +1010,7 @@ class OPTForCausalLM(OPTPreTrainedModel):
         return reordered_past
 
 
+# 序列分类（如情感分析）
 @add_start_docstrings(
     """
     The OPT Model transformer with a sequence classification head on top (linear layer).
@@ -1129,6 +1142,7 @@ class OPTForSequenceClassification(OPTPreTrainedModel):
         self.model.decoder.embed_tokens = value
 
 
+# 阅读理解问答
 @add_start_docstrings(
     """
     The OPT Model transformer with a span classification head on top for extractive question-answering tasks like SQuAD

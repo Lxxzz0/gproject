@@ -272,7 +272,6 @@ def print_cpu_mem_usage(message = None):
     return vir_mem
 
 
-# 输出日志
 def write_benchmark_log(filename, model_size, cache_size, hidden_size,
         gpu_peak_mem, projected, prefill_latency, prefill_throughput,
         decode_latency, decode_throughput, total_latency, total_throughput):

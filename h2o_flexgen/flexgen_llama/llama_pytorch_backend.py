@@ -30,6 +30,20 @@ def fix_recursive_import():
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
 
+# 旋转位置编码
+def rotate_half(x):
+        """Rotates half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+# rope
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 class DeviceType(Enum):
     CPU = auto()
@@ -109,18 +123,15 @@ class TorchTensor:
         self.device = self.data = None
 
     def load_from_np(self, np_array):
-        # 如果是磁盘设备，将数据写入文件
         if self.device.device_type == DeviceType.DISK:
             with open(self.data, "wb") as fout:
                 np.save(fout, np_array)
         else:
-            # 如果是压缩设备，将数据压缩后写入
             if self.device.device_type == DeviceType.COMPRESSED:
                 tmp = torch.from_numpy(np_array)
                 tmp = global_cpu_device.compressed_device.compress(tmp, self.data[2])
                 general_copy(self, None, tmp, None)
             else:
-                # 如果是CPU或GPU设备，直接将数据写入
                 self.data.copy_(torch.from_numpy(np_array))
 
     def load_from_np_file(self, filename):
@@ -129,11 +140,11 @@ class TorchTensor:
         else:
             self.load_from_np(np.load(filename))
 
-    # 
     def copy(self, dst, src_indices=None):
         if src_indices:
             assert all(x.step is None for x in src_indices)
-            shape = tuple(x.stop - x.start for x in src_indices) + self.shape[len(src_indices):]
+            shape = tuple(x.stop - x.start for x in src_indices
+                ) + self.shape[len(src_indices):]
         else:
             shape = self.shape
 
@@ -144,8 +155,6 @@ class TorchTensor:
         general_copy(ret, None, self, src_indices)
         return ret
 
-    # 如果当前张量的设备与目标设备相同，则直接返回当前张量，并返回 False 表示没有进行复制操作
-    # 如果设备不同，则调用 copy 方法将张量复制到目标设备，并返回新张量。返回 True 表示进行了复制操作
     def smart_copy(self, dst, src_indices=None):
         if self.device == dst:
             return self, False
@@ -230,7 +239,8 @@ class TorchDevice:
                 config, task, policy)
 
     def next_attention_compute_workspace(self):
-        self.workspace_pt = (self.workspace_pt + 1) % len(self.attention_compute_workspace)
+        self.workspace_pt = (self.workspace_pt + 1) % len(
+            self.attention_compute_workspace)
         return self.attention_compute_workspace[self.workspace_pt]
 
     def del_attention_compute_workspace(self):
@@ -251,40 +261,28 @@ class TorchDevice:
         if donate[0]: attention_mask.delete()
         return TorchTensor.create_from_torch(data, self)
 
-    # 嵌入层的计算
-    def opt_input_embed(self, inputs, attention_mask, w_token, w_pos, pad_token_id, donate, hh_long_seq=False):
-        # decompress weights
+    # 嵌入层计算，只计算词嵌入
+    def llama_input_embed(self, inputs, attention_mask, w_token, pad_token_id, donate, hh_long_seq=False):
+        # 如果被压缩，解压
         if w_token.device.device_type == DeviceType.COMPRESSED:
             w_token = w_token.device.decompress(w_token)
-            w_pos = w_pos.device.decompress(w_pos)
 
         token_ids = inputs.data
         mask = attention_mask.data
+        # 释放输入和掩码的内存
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
-        # token embedding
-        token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
+        # 计算词嵌入
+        token_embed = F.embedding(token_ids, w_token.data, padding_idx=pad_token_id)
 
         if hh_long_seq:
             return TorchTensor.create_from_torch(token_embed, self)
 
-        # pos embedding
-        positions = torch.cumsum(mask, dim=1).int() * mask + 1
+        # 位置编码在注意力层通过RoPE计算
+        return TorchTensor.create_from_torch(token_embed, self)
 
-        # cut positions if `past_key_values_length` is > 0
-        past_key_values_length = mask.shape[1] - token_ids.shape[1]
-        positions = positions[:, past_key_values_length:]
-
-        pos_embed = F.embedding(positions, w_pos.data)
-
-        # print("input_embed", token_embed.shape, token_embed)
-        # print("pos_embed", pos_embed.shape, pos_embed)
-
-        data = token_embed + pos_embed
-        return TorchTensor.create_from_torch(data, self)
-
-    def opt_output_embed(self, inputs, w_ln, b_ln, w_token, donate,
+    def llama_output_embed(self, inputs, w_ln, b_ln, w_token, donate,
                          do_sample, temperature):
         # decompress weights
         if w_token.device.device_type == DeviceType.COMPRESSED:
@@ -323,7 +321,7 @@ class TorchDevice:
         acc = self.allocate(shape[:-1], np.float16, pin_memory=pin_memory)
         return k_cache, v_cache, acc
 
-    # 计算多头注意力
+    # 注意力层计算（预填充阶段）
     def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
             w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config, hh_k=None, hh_all=None):
         """Multi-head attention (prefill phase)."""
@@ -334,10 +332,12 @@ class TorchDevice:
             w_v = w_v.device.decompress(w_v)
             w_out = w_out.device.decompress(w_out)
 
+        # 批次大小，序列长度，隐藏维度
         b, s, h = inputs.shape
         head_dim = h // n_head
         scaling = head_dim ** -0.5
 
+        # 传递归一化层的参数来归一化输入
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
 
         # shape: (b, s, h)
@@ -349,6 +349,16 @@ class TorchDevice:
         k = k.view(b, s, n_head, head_dim)
         v = v.view(b, s, n_head, head_dim)
 
+        cos, sin = None
+        if cos is not None and sin is not None:
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # 拓展头的数量
+        num_kv_heads = k.shape[2]
+        k = k.repeat(1, 1, n_head // num_kv_heads, 1)
+        v = v.repeat(1, 1, n_head // num_kv_heads, 1)
+
+        # 计算 q * k
         # shape: (b * n_head, s, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
         # shape: (b * n_head, head_dim, s)
@@ -359,6 +369,7 @@ class TorchDevice:
         # shape: (b * n_head, s, s)
         attn_weights = torch.bmm(q, k)
 
+        # 计算掩码
         # shape: (b, 1, s, s)
         idx = torch.arange(s, device=self.dev)
         causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
@@ -375,9 +386,7 @@ class TorchDevice:
         value = value.transpose(1, 2).reshape(b, s, h)
 
         # print("after bmm (prompt)", value)
-
         value = F.linear(value, w_out.data, bias=b_out.data)
-
         value.add_(inputs.data)
 
         if donate[0]: inputs.delete()
@@ -428,6 +437,15 @@ class TorchDevice:
         q = q.view(b, tgt_s, n_head, head_dim)
         k = k.view(b, tgt_s, n_head, head_dim)
         v = v.view(b, tgt_s, n_head, head_dim)
+
+        cos, sin = None
+        if cos is not None and sin is not None:
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # 拓展头的数量
+        num_kv_heads = k.shape[2]
+        k = k.repeat(1, 1, n_head // num_kv_heads, 1)
+        v = v.repeat(1, 1, n_head // num_kv_heads, 1)
 
         # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
@@ -1000,7 +1018,7 @@ def acc_replace(dst, dst_indices, src, hh_k, oldest):
     dst.data.scatter_(0, indices, least_recent)
     dst.data[oldest] = src.data[-1]
 
-# 如果目标张量和源张量在混合设备上，那么我们需要递归调用general_copy函数，将复制任务分发到各个基础设备上。
+
 def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
                  src: TorchTensor, src_indices: Tuple[slice]):
     """Launch a general asynchronous copy between two tensors.

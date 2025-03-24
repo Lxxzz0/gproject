@@ -15,12 +15,12 @@ from rouge import Rouge
 import logging
 import numpy as np
 
-from lost_in_the_middle.prompting import (
-    Document,
-    get_closedbook_qa_prompt,
-    get_qa_prompt,
-    get_qa_prompt_index
-)
+# from lost_in_the_middle.prompting import (
+#     Document,
+#     get_closedbook_qa_prompt,
+#     get_qa_prompt,
+#     get_qa_prompt_index
+# )
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
@@ -48,6 +48,23 @@ TAGET_MODULE = {
     "llama": None,
     "llama_h2o": H2OLlamaAttention
 }
+
+# 画图
+def plot_all_scores(all_rouge_scores_list):
+    x = range(1, len(all_rouge_scores_list[0]) + 1)
+    plt.figure(figsize=(10, 5))
+
+    plt.plot(x, all_rouge_scores_list[0], label='ROUGE-1')
+    plt.plot(x, all_rouge_scores_list[1], label='ROUGE-2')
+    plt.plot(x, all_rouge_scores_list[2], label='ROUGE-L')
+
+    plt.xlabel('Sample Index')
+    plt.ylabel('ROUGE Score')
+    plt.title('ROUGE Scores for Generated Texts')
+    plt.legend()
+    plt.savefig(f'./summary_results/xsum_0_h2o_rouge_scores_tmp.png')
+    plt.show()
+    
 
 if __name__ == '__main__':
 
@@ -118,8 +135,10 @@ if __name__ == '__main__':
     rouge2_score_list = []
     rougel_score_list = []
 
+    all_rouge_scores_list = [[] for _ in range(3)]
+
     with torch.no_grad():
-        for request in tqdm.tqdm(requests):
+        for request in tqdm.tqdm(requests[:50]):
             result = {'request': request, 'result': {}}
             prompt = request['article']
             label = request['summary_gt']
@@ -175,7 +194,13 @@ if __name__ == '__main__':
             }
             
             results.append(result)
+            # 记录 rouge 分数
+            all_rouge_scores_list[0].append(np.mean(rouge1_score_list))
+            all_rouge_scores_list[1].append(np.mean(rouge2_score_list))
+            all_rouge_scores_list[2].append(np.mean(rougel_score_list))
             print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(np.mean(rouge1_score_list), np.mean(rouge2_score_list), np.mean(rougel_score_list)))
+
+    plot_all_scores(all_rouge_scores_list)
 
     with open(output_path, 'w') as f:
         for result in results:

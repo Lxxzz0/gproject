@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m flexgen.flex_opt --model huggyllama/llama-7b --gpu-batch-size 32 --percent 100 0 100 0 100 0
+python3 -m flexgen.flex_llama --model facebook/opt-1.3b --gpu-batch-size 32 --percent 100 0 100 0 100 0
 """
 
 import argparse
@@ -16,14 +16,13 @@ from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
 
-# 要改动
-from flexgen.compression import CompressionConfig
-from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
-from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
+from flexgen_llama.compression import CompressionConfig
+from flexgen_llama.llama_config import OptConfig, get_opt_config, download_opt_weights
+from flexgen_llama.llama_pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import,
     cache_replace, acc_replace)
-from flexgen.timer import timers
-from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
+from flexgen_llama.timer import timers
+from flexgen_llama.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, print_cpu_mem_usage,
     write_benchmark_log, read_benchmark_log)
@@ -32,6 +31,51 @@ fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
+
+class TransformerLayer:
+    def __init__(self, config, env, policy, i):
+        self.attention = SelfAttention(config, env, policy, i)
+        self.mlp = MLP(config, env, policy, i)
+        self.policy = policy
+        self.compute = self.attention.compute
+
+    def set_task(self, task):
+        self.attention.set_task(task)
+        self.mlp.set_task(task)
+
+    def init_weight(self, weight_home, path):
+        home1, home2 = ValueHolder(), ValueHolder()
+        self.attention.init_weight(home1, path)
+        self.mlp.init_weight(home2, path)
+        weight_home.store((home1, home2))
+
+    def load_weight(self, weight_home, weight_read_buf, k):
+        read_buf1, read_buf2 = ValueHolder(), ValueHolder()
+        home1, home2 = weight_home.val
+        self.attention.load_weight(home1, read_buf1, k)
+        self.mlp.load_weight(home2, read_buf2, k)
+        if k == 0:
+            weight_read_buf.store((read_buf1, read_buf2))
+
+    def init_cache_one_gpu_batch(self, cache_home):
+        self.attention.init_cache_one_gpu_batch(cache_home)
+
+    def load_cache(self, cache_home, cache_read_buf, i):
+        self.attention.load_cache(cache_home, cache_read_buf, i)
+
+    def store_cache(self, cache_home, cache_write_buf, i):
+        self.attention.store_cache(cache_home, cache_write_buf, i)
+
+    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+                cache_write_buf, i, k):
+        if k == self.policy.num_gpu_batches - 1:
+            read_buf1, read_buf2 = weight_read_buf.pop()
+        else:
+            read_buf1, read_buf2 = weight_read_buf.val
+
+        self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
+                               cache_write_buf, i, k)
+        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
@@ -50,7 +94,7 @@ class Policy:
     overlap: bool
 
     # Whether to separate attention and mlp as two layers
-    sep_layer: bool # 默认为 True
+    sep_layer: bool # 默认为 True，分层
 
     # Whether to use pinned memory for weights on CPU
     pin_weight: bool
@@ -97,16 +141,14 @@ def get_choice(cur_percent, percents, choices):
     return choices[-1]
 
 
-# 通用的权重初始化函数
 def init_weight_list(weight_specs, policy, env):
     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
     dev_choices = [env.disk, env.cpu, env.gpu]
 
-    sizes = [np.prod(spec[0]) for spec in weight_specs] # 计算权重的数量
-    sizes_cumsum = np.cumsum(sizes) # 计算权重的数量的累加和（前缀和）
+    sizes = [np.prod(spec[0]) for spec in weight_specs]
+    sizes_cumsum = np.cumsum(sizes)
     ret = []
     for i in range(len(weight_specs)):
-        # 选择设备
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
         shape, dtype, filename = weight_specs[i]
@@ -118,20 +160,16 @@ def init_weight_list(weight_specs, policy, env):
             pin_memory = policy.pin_weight
             compress = policy.compress_weight
 
-        # 不启用压缩
         if not compress:
             weight = home.allocate(shape, dtype, pin_memory=pin_memory)
 
             if DUMMY_WEIGHT not in filename:
-                # 加载权重
                 weight.load_from_np_file(weight_specs[i][2])
             else:
-                # 权重初始化为 1
                 weight.load_from_np(np.ones(shape, dtype))
                 #weight.load_from_np(np.random.rand(*shape).astype(dtype))
         else:
-            weight = home.compressed_device.allocate(
-                shape, dtype, policy.comp_weight_config, pin_memory=pin_memory)
+            weight = home.compressed_device.allocate(shape, dtype, policy.comp_weight_config, pin_memory=pin_memory)
 
             if DUMMY_WEIGHT not in filename:
                 weight.load_from_np_file(weight_specs[i][2])
@@ -144,89 +182,58 @@ def init_weight_list(weight_specs, policy, env):
     return ret
 
 
-# 默认不使用这个
-class TransformerLayer:
-    def __init__(self, config, env, policy, i):
-        self.attention = SelfAttention(config, env, policy, i)
-        self.mlp = MLP(config, env, policy, i)
-        self.policy = policy
-        self.compute = self.attention.compute
-
-    def set_task(self, task):
-        self.attention.set_task(task)
-        self.mlp.set_task(task)
-
-    def init_weight(self, weight_home, path):
-        home1, home2 = ValueHolder(), ValueHolder()
-        self.attention.init_weight(home1, path)
-        self.mlp.init_weight(home2, path)
-        weight_home.store((home1, home2))
-
-    def load_weight(self, weight_home, weight_read_buf, k):
-        read_buf1, read_buf2 = ValueHolder(), ValueHolder()
-        home1, home2 = weight_home.val
-        self.attention.load_weight(home1, read_buf1, k)
-        self.mlp.load_weight(home2, read_buf2, k)
-        if k == 0:
-            weight_read_buf.store((read_buf1, read_buf2))
-
-    def init_cache_one_gpu_batch(self, cache_home):
-        self.attention.init_cache_one_gpu_batch(cache_home)
-
-    def load_cache(self, cache_home, cache_read_buf, i):
-        self.attention.load_cache(cache_home, cache_read_buf, i)
-
-    def store_cache(self, cache_home, cache_write_buf, i):
-        self.attention.store_cache(cache_home, cache_write_buf, i)
-
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
-        if k == self.policy.num_gpu_batches - 1:
-            read_buf1, read_buf2 = weight_read_buf.pop()
-        else:
-            read_buf1, read_buf2 = weight_read_buf.val
-
-        self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
-                               cache_write_buf, i, k)
-        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
-
-
+# 嵌入层
 class InputEmbed:
     def __init__(self, config, env, policy):
         self.config = config
         self.env = env
         self.policy = policy
         self.compute = self.env.gpu
-        # 是否进行量化，权重压缩
-        self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight else self.compute)
+        self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
+            else self.compute)
+
         self.task = None
 
     def set_task(self, task):
         self.task = task
 
     def init_weight(self, weight_home, path):
-        v, h, s, dtype = (self.config.vocab_size, self.config.input_dim, self.config.max_seq_len, self.config.dtype)
+        v, h, dtype = (self.config.vocab_size, self.config.hidden_size, self.config.dtype)
         path = os.path.join(path, "")
         weight_specs = [
-            # w_token
-            # 词汇表大小，嵌入维度。定义了词汇嵌入层的权重规格，用于将词汇表中的每个词汇映射到一个向量表示
-            ((v, h), dtype, path + "decoder.embed_tokens.weight"),
-            # w_pos
-            # 序列长度，嵌入维度。定义了位置嵌入层的权重规格，用于为输入序列中的每个位置生成一个向量表示
-            ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
+            # 仅保留词嵌入矩阵
+            ((v, h), dtype, path + "model.embed_tokens.weight")
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
-
         weight_home.store(weights)
 
+
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_token, w_pos = weight_home.val
-        # 第一批的话，要把权重加载到 weight_read_buf 中
+        # 只保存词嵌入矩阵
+        w_token = weight_home.val
         if k == 0:
             dst = self.weight_load_dst
-            weight_read_buf.store((w_token.smart_copy(dst), w_pos.smart_copy(dst)))
+            weight_read_buf.store(w_token.smart_copy(dst),)
 
-    # 以下三个函数都是空函数，不做任何操作
+    def input_act_shape_and_dtype(self, batch_size, seq_len):
+        return (batch_size, seq_len), np.int64
+
+    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
+        # 计算词嵌入
+        donate = [False] * 3
+        h, donate[0] = hidden.val, True
+        mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+
+        if k == self.policy.num_gpu_batches - 1:
+            # Clear the weight_read_buf if it is the last gpu batch
+            (w_token, donate[2]) = weight_read_buf.pop()
+        else:
+            (w_token, _) = weight_read_buf.val
+
+        h = self.compute.llama_input_embed(h, mask, w_token, self.config.pad_token_id, donate, hh_long_seq=self.policy.hh_long_seq)
+        hidden.val = h
+
+    # 不操作
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
 
@@ -236,29 +243,8 @@ class InputEmbed:
     def store_cache(self, cache_home, cache_write_buf, i):
         pass  # do nothing
 
-    # 返回输入激活（activation）的形状和数据类型
-    def input_act_shape_and_dtype(self, batch_size, seq_len):
-        return (batch_size, seq_len), np.int64
 
-    # 从内存中取出，然后按原方法进行计算
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
-        # Compute input embedding
-        donate = [False] * 4    # 标记哪些变量可以被释放以节省内存
-        h, donate[0] = hidden.val, True
-        mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-
-        if k == self.policy.num_gpu_batches - 1:
-            # Clear the weight_read_buf if it is the last gpu batch
-            # 最后一批的话就要清空 weight_read_buf
-            (w_token, donate[2]), (w_pos, donate[3]) = weight_read_buf.pop()
-        else:
-            (w_token, _), (w_pos, _) = weight_read_buf.val
-
-        h = self.compute.opt_input_embed(h, mask, w_token, w_pos, 
-                                            self.config.pad_token_id, donate, hh_long_seq=self.policy.hh_long_seq)
-        hidden.val = h
-
-
+# 输出层
 class OutputEmbed:
     def __init__(self, config, env, policy):
         self.config = config
@@ -327,6 +313,35 @@ class OutputEmbed:
         hidden.val = h
 
 
+# RoPE 位置编码
+class LlamaROPE:
+    def __init__(self, dim, max_seq_len=4096):
+        self.dim = dim
+        # 预计算频率矩阵（复数形式）
+        theta = 1.0 / (10000 ** (torch.arange(0, dim//2, 2)/dim))
+        positions = torch.arange(max_seq_len)
+        freqs = torch.outer(positions, theta)
+        self.freq_cis = torch.polar(torch.ones_like(freqs), freqs)  # e^(iθ)
+    
+    def apply(self, x, positions):
+        """应用旋转位置编码到输入张量
+        Args:
+            x: [batch, seq, heads, dim]
+            positions: [batch, seq] 绝对位置索引
+        """
+        # 切片获取对应位置的频率
+        batch, seq, _, _ = x.shape
+        freqs = self.freq_cis[positions]  # [batch, seq, dim//2]
+        
+        # 转换为复数并旋转
+        x_complex = torch.view_as_complex(
+            x.reshape(batch, seq, -1, self.dim//2, 2)
+        )
+        x_rot = x_complex * freqs.unsqueeze(2)  # 广播到每个头
+        
+        # 转换回实数
+        return torch.view_as_real(x_rot).flatten(3,4)
+
 class SelfAttention:
     def __init__(self, config, env, policy, layer_id):
         self.config = config
@@ -336,6 +351,7 @@ class SelfAttention:
         self.compute = self.env.gpu
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight else self.compute)
         self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute else self.env.gpu)
+        self.rope = LlamaROPE(config.hidden_size)  # 新增，位置编码
 
         self.task = None
 
@@ -346,7 +362,6 @@ class SelfAttention:
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
         path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}.self_attn"))
-        # q k v o norm，一层的参数量吗
         weight_specs = [
             # w_q
             ((h, h), dtype, path + ".q_proj.weight"),
@@ -383,19 +398,6 @@ class SelfAttention:
                 w_v.smart_copy(dst1), b_v.smart_copy(dst2),
                 w_out.smart_copy(dst1), b_out.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
-            
-        # 自注意力机制（Self-Attention Mechanism）：
-        # w_q：查询（Query）权重矩阵。
-        # b_q：查询（Query）偏置向量。
-        # w_k：键（Key）权重矩阵。
-        # b_k：键（Key）偏置向量。
-        # w_v：值（Value）权重矩阵。
-        # b_v：值（Value）偏置向量。
-        # w_out：输出（Output）权重矩阵。
-        # b_out：输出（Output）偏置向量。
-        # 层归一化（Layer Normalization）：
-        # w_ln：层归一化的权重向量。
-        # b_ln：层归一化的偏置向量。
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -421,7 +423,6 @@ class SelfAttention:
         k_home, v_home, acc = cache_home.val
 
         # Pick code path
-        # 确定路径
         if self.policy.compress_cache:
             path = 0
             dst = self.attention_compute.compressed_device
@@ -436,7 +437,6 @@ class SelfAttention:
                 path = 0
             dst = self.attention_compute
 
-        # 计算缓存的最大位置
         pos = min(self.hh_k * 2 - 1, self.task.prompt_len) + 1
         if path == 0:  # Direct copy
             # shape: (s, b * n_head, head_dim)
@@ -454,7 +454,6 @@ class SelfAttention:
                     acc.smart_copy(dst, indices),
                 ))
             else:
-                # 不复制累计分数
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     (v_home, False),
@@ -531,7 +530,8 @@ class SelfAttention:
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
+    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+                cache_write_buf, i, k):
         n_head = self.config.n_head
 
         donate = [False] * 14
@@ -539,7 +539,6 @@ class SelfAttention:
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            # 如果是最后一批，就清空 weight_read_buf
             ((w_q, donate[2]), (b_q, donate[3]), (w_k, donate[4]), (b_k, donate[5]),
              (w_v, donate[6]), (b_v, donate[7]), (w_out, donate[8]), (b_out, donate[9]),
              (w_ln, donate[10]), (b_ln, donate[11])) = weight_read_buf.pop()
@@ -589,7 +588,8 @@ class MLP:
         self.layer_id = layer_id
         self.policy = policy
         self.compute = self.env.gpu
-        self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight else self.compute)
+        self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
+            else self.compute)
 
         self.task = None
 
@@ -629,7 +629,6 @@ class MLP:
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
 
-        # 不用管 cache
     def load_cache(self, cache_home, cache_read_buf, i):
         pass  # do nothing
 
@@ -655,8 +654,7 @@ class MLP:
         h = self.compute.mlp(h, wi, bi, wo, bo, w_ln, b_ln, donate)
         hidden.val = h
 
-
-class OptLM:
+class LlamaLM:
     def __init__(self,
                  config: Union[str, OptConfig],
                  env: ExecutionEnv,
@@ -670,11 +668,9 @@ class OptLM:
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
 
-        # 初始化所有层
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
         for i in range(self.config.num_hidden_layers):
-            # 默认为 True，把 attention 和 mlp 分开
             if policy.sep_layer:
                 layers.append(SelfAttention(self.config, self.env, self.policy, i))
                 layers.append(MLP(self.config, self.env, self.policy, i))
@@ -704,7 +700,6 @@ class OptLM:
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
 
         # cache[j][k]
-        # 初始化 cache weights attention_mask，每个位置都有相应的值
         self.cache_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
         self.cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
         self.cache_write_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
@@ -716,24 +711,22 @@ class OptLM:
         self.task = None
         self.init_all_weights()
 
-    # 设置hh_k
+    # 会设置hh_k
     def set_task(self, task):
         self.task = task
         for l in self.layers:
             l.set_task(task)
         self.hh_k = int(task.prompt_len * self.policy.hh_ratio)
 
-    # 让层调用自己的方法
     def init_weight(self, j):
-        expanded_path = os.path.abspath(os.path.expanduser(os.path.join(self.path, f"{self.config.name}-np")))
+        expanded_path = os.path.abspath(os.path.expanduser(
+            os.path.join(self.path, f"{self.config.name}-np")))
         check_path = os.path.join(expanded_path, "decoder.embed_positions.weight")
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
             download_opt_weights(self.config.name, self.path)
 
-        # 初始化每一层的权重。每层会调用自己的 init_weight 方法
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
 
-    # 让层调用自己的方法
     def load_weight(self, i, j, k, overlap=True):
         # Handle corner cases
         if j == self.num_layers:
@@ -758,11 +751,9 @@ class OptLM:
                 else:
                     x.delete()
 
-    # 让层调用自己的方法
     def init_cache(self, j, k):
         self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
 
-    # 让层调用自己的方法
     def load_cache(self, i, j, k, overlap=True):
         # Handle corner cases
         if i == 0:  # prefill, no cache
@@ -783,7 +774,6 @@ class OptLM:
         else:
             self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
 
-    # 让层调用自己的方法
     def store_cache(self, i, j, k, overlap=True):
         # Handle corner cases
         if k == -1:
@@ -814,34 +804,28 @@ class OptLM:
 
     def load_hidden(self, i, j, k):
         # Handle corner cases
-        # 处理边界情况
-        if k == self.num_gpu_batches:   # 最后一批
+        if k == self.num_gpu_batches:
             k = 0
             j += 1
-        if j == self.num_layers:    # 最后一层
+        if j == self.num_layers:
             j = 0
             i += 1
-            if i == self.execute_gen_len:   # 生成结束
+            if i == self.execute_gen_len:
                 return
 
         # Load to hidden states buffers
-        dst = self.layers[j].compute    # 选择计算设备
+        dst = self.layers[j].compute
         if j == 0:
-            # 第一层
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
             if i == 0:  # load from the input ids
-                # 从输入的 ids 中加载
-                # allocate 返回张量实例
                 val = dst.allocate((gpu_batch_size, self.task.prompt_len), np.int32)
                 val.load_from_np(self.output_ids[left:right, :self.task.prompt_len])
             else:  # load from the last generated token
-                # 从上一个生成的 token 中加载
                 pos = self.task.prompt_len + i
                 val = dst.allocate((gpu_batch_size, 1), np.int32)
                 val.load_from_np(self.output_ids[left:right, pos-1:pos])
-        else:
-            # 不是第一层，从上一层的 hidden 中加载
+        else:  # load from the last layer
             val = self.hidden[i][j-1][k].pop().move(dst)
         self.hidden[i][j][k].store(val)
 
@@ -864,30 +848,25 @@ class OptLM:
             pos = self.task.prompt_len + i
             if self.task.stop:
                 stopped = self.stopped[left:right]
-                self.output_ids[left:right, pos:pos+1] = np.where(
-                    stopped, self.config.pad_token_id, ids)
+                self.output_ids[left:right, pos:pos+1] = np.where(stopped, self.config.pad_token_id, ids)
                 stopped[:] = np.logical_or(stopped, ids == self.task.stop)
             else:
+                # 如果不是最后一个token，直接拼到输出矩阵上
                 self.output_ids[left:right, pos:pos+1] = ids
         else:  # move to home
-            # 是中间层，移动到 home
             x = self.hidden[i][j][k]
             if x.val:  # x may already be moved due to overlapping
                 x.val = x.val.move(self.act_home)
 
-    # 让层调用自己的方法
     def compute_layer(self, i, j, k):
         # Update the hidden in place
         # Clear the weight_read_buf if it is the last gpu batch
         # Clear the cache_read_buf
         # Run layer computation
-
-        # 前向传播，要传递 hidden，缓存的读写缓冲区，权重的读缓冲区，注意力掩码，i，k
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
-                                self.weight_read_buf[j], self.attention_mask[k],
-                                self.cache_write_buf[j][k], i, k)
+            self.weight_read_buf[j], self.attention_mask[k],
+            self.cache_write_buf[j][k], i, k)
 
-    # 同步
     def sync(self):
         self.env.disk.synchronize()
         torch.cuda.synchronize()
@@ -901,7 +880,6 @@ class OptLM:
         for j in range(self.num_layers):
             self.delete_weight(j, 0)
 
-    # 计算掩码
     def update_attention_mask(self, i, k):
         if i > 0:
             mask = self.attention_mask[k]
@@ -919,8 +897,10 @@ class OptLM:
         right = left + gpu_batch_size
         input_ids = self.output_ids[left:right, :self.task.prompt_len]
 
-        attention_compute = (self.env.cpu if self.policy.cpu_cache_compute else self.env.gpu)
-        val = attention_compute.allocate((self.policy.gpu_batch_size, self.task.prompt_len), bool)
+        attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
+            else self.env.gpu)
+        val = attention_compute.allocate(
+            (self.policy.gpu_batch_size, self.task.prompt_len), bool)
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[k].store(val)
 
@@ -950,9 +930,8 @@ class OptLM:
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
 
         # Output token ids
-        # 初始化生成任务的输出 ID 和停止标志，并确保输入数据的大小与 GPU 批次大小和数量匹配
-        # 把新生成的 token 直接放到 output_ids 中
-        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len), self.config.pad_token_id, dtype=np.int32)
+        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
+            self.config.pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)
@@ -978,7 +957,6 @@ class OptLM:
             for k in range(num_gpu_batches):
                 self.init_cache(j, k)
         if self.policy.cpu_cache_compute:
-            # 用到了 hh_k
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy, self.hh_k)
         print_cpu_mem_usage("after init cache")
 
@@ -1024,7 +1002,6 @@ class OptLM:
                 for k in range(self.num_gpu_batches):
                     self.load_weight(i, j, k, overlap=False)
 
-                # 设计到中间层的数据传递，用 OptLM 的函数，加载和存储 cache ，以及计算，用自己模块的函数
                 for k in range(self.num_gpu_batches):
                     self.load_cache(i, j, k, overlap=False)
                     self.load_hidden(i, j, k)
@@ -1309,13 +1286,14 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
     return (input_ids[0],) * num_prompts
 
 
-# 运行任务
 def run_flexgen(args):
+    # 提词器，需要修改为对应的模型
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
     else:
         tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left", use_fast=True)
 
+        
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
 
@@ -1347,7 +1325,6 @@ def run_flexgen(args):
                     hh_long_seq=args.hh_long_seq)
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    # 配置
     opt_config = get_opt_config(args.model)
     cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
@@ -1373,6 +1350,7 @@ def run_flexgen(args):
     finally:
         env.close_copy_threads()
 
+    # 以下能够复用，输出日志
     # Log output
     prefill_latency = costs[0]
     prefill_throughput = num_prompts * prompt_len / prefill_latency
@@ -1413,11 +1391,12 @@ def run_flexgen(args):
         print(log_str)
 
 
-# 接收参数
+# 获取参数
 def add_parser_arguments(parser):
-    parser.add_argument("--model", type=str, default="facebook/opt-2.7b",
+    parser.add_argument("--model", type=str, default="huggyllama/llama-7b",
         help="The model name.")
-    parser.add_argument("--path", type=str, default="~/opt_weights",
+    # 模型权重路径
+    parser.add_argument("--path", type=str, default="~/llama_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="~/flexgen_offload_dir",
