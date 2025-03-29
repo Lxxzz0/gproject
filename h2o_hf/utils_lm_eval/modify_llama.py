@@ -347,10 +347,12 @@ class LlamaAttention_heavy_hitter(nn.Module):
 
         # 控制 kv cache
         self.kv_cache = H2OKVCache_LayerWise(
-            # hh_size=config.hh_size,
-            # recent_size=config.recent_size,
-            hh_size=4,
-            recent_size=512,
+            hh_size=config.hh_size,
+            recent_size=config.recent_size,
+            hh_ratio=config.hh_ratio,
+            recent_ratio=config.recent_ratio,
+            # hh_size=4,
+            # recent_size=512,
             k_seq_dim=2,
             v_seq_dim=2,
         )
@@ -418,7 +420,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
         #     key_states = torch.cat([past_key, key_states], dim=2)
         #     value_states = torch.cat([past_value, value_states], dim=2)
 
-        pdb.set_trace()
+        # pdb.set_trace()
         # 修改编码位置
         # 计算原始注意力分数
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)

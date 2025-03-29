@@ -132,13 +132,11 @@ if __name__ == '__main__':
                     
                 else:
                     assert False
-                
 
             out = {
                 'mask_loss': mask_loss,
                 'each_correct': each_correct,
             }
-            
             
             return out
 

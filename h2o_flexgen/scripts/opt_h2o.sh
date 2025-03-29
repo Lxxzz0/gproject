@@ -1,4 +1,6 @@
-export HF_HOME="/home/ubuntu/data/gproject/h2o_flexgen/models"
+# export HF_HOME="/home/ubuntu/data/hf_cache"
+# 设置 PYTHONPATH，确保 Python 能找到 flexgen_opt 模块
+export PYTHONPATH=$PYTHONPATH:~/data/H2O-main/h2o_flexgen
 
 # flexgen
 # python flex_opt.py --gpu-batch-size 1 --overlap false --model facebook/opt-6.7b

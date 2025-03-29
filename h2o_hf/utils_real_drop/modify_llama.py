@@ -229,21 +229,32 @@ def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
 class H2OKVCache_LayerWise:
     def __init__(
         self,
-        hh_size=4,
+        hh_size=8,
         recent_size=512,
         k_seq_dim=2,
         v_seq_dim=2,
+        hh_ratio=0,
+        recent_ratio=1,
     ):
-        print(f"H2OKVCache-LayerWise: {hh_size}, {recent_size}")
+        self.hh_ratio = hh_ratio
+        self.recent_ratio = recent_ratio
         self.hh_size = hh_size
         self.recent_size = recent_size
-        self.cache_size = hh_size + recent_size
+        # self.cache_size = hh_size + recent_size
+        self.cache_size = 0
         self.k_seq_dim = k_seq_dim
         self.v_seq_dim = v_seq_dim
         self.hh_score = None
+        # print(f"H2OKVCache-LayerWise: {hh_size}, {recent_size}")
+        
 
     def __call__(self, past_key_values, attn_score_cache):
-
+        if self.cache_size == 0:
+            self.hh_size = int(attn_score_cache.shape[2] * self.hh_ratio)
+            self.recent_size = int(attn_score_cache.shape[2] * self.recent_ratio)
+            self.cache_size = self.hh_size + self.recent_size
+            # print(f"H2OKVCache-LayerWise: {self.hh_size}, {self.recent_size}")
+        # pdb.set_trace()
         self._update_hh_score(attn_score_cache)
 
         if past_key_values is None:
@@ -255,21 +266,41 @@ class H2OKVCache_LayerWise:
         # hh-selection
         bsz, num_heads, _, head_dim = past_key_values[0].shape
 
+        # 在滑动窗口前选择 hh_size 个 token
         select_hh_scores = self.hh_score[:, :seq_len - self.recent_size]
         _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
         keep_topk = keep_topk.sort().values
+        # i = 5
+        # for ii in range(i):
+        #     keep_topk[:, ii] = ii
 
+        # pdb.set_trace()
+
+        # 选择滑动窗口内的 token
         # keep_recent = torch.arange(seq_len - self.recent_size, seq_len).expand(keep_topk.shape[0], 1).to(keep_topk.device)
         keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
         keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
-
+        
+        i = 0
+        keep_i_past_k_token = past_key_values[0][:, :, : i, :]
+        keep_i_past_v_token = past_key_values[1][:, :, : i, :]
+        keep_i_hh_token = self.hh_score[:, : i]
+        # print(i)
+        
         mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
         mask = mask.scatter(-1, keep_idx, 1)
 
+        # kv缓存的形状是[bsz, num_heads, seq_len, head_dim]
         k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
         v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
 
+        k_hh_recent = torch.cat([keep_i_past_k_token, k_hh_recent], dim=2)
+        v_hh_recent = torch.cat([keep_i_past_v_token, v_hh_recent], dim=2)
+
         self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
+        self.hh_score = torch.cat([keep_i_hh_token, self.hh_score], dim=1)
+
+        # self.cache_size -= count
 
         return (k_hh_recent, v_hh_recent)
 
@@ -302,12 +333,17 @@ class H2OKVCache_LayerWise:
         return (k_hh_recent, v_hh_recent)
 
     def _update_hh_score(self, attn_score_cache):
-
+        # pdb.set_trace()
+        # 新增的 token 数
         num_new_tokens = attn_score_cache.shape[2]
 
         if self.hh_score is None:
+            # [num_head, seq_len（q的长度）] 
             self.hh_score = attn_score_cache.sum(0).sum(1)
         else:
+            # 把分数累加到旧的 token 上
+            # if attn_score_cache.shape[1] - num_new_tokens > self.hh_score.shape[1]:
+            #     num_new_tokens = attn_score_cache.shape[1] - self.hh_score.shape[1]
             attn_score_cache = attn_score_cache.sum(0).sum(1)
             attn_score_cache[:, :-num_new_tokens] += self.hh_score
             self.hh_score = attn_score_cache
@@ -344,6 +380,8 @@ class H2OLlamaAttention(nn.Module):
         self.kv_cache = H2OKVCache_LayerWise(
             hh_size=config.hh_size,
             recent_size=config.recent_size,
+            hh_ratio=config.hh_ratio,
+            recent_ratio=config.recent_ratio,
             k_seq_dim=2,
             v_seq_dim=2,
         )
@@ -445,6 +483,8 @@ class H2OLlamaAttention(nn.Module):
             device=query_states.device,
         )
 
+        # pdb.set_trace()
+
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
@@ -471,9 +511,7 @@ class H2OLlamaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
-            self.head_dim
-        )
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -489,6 +527,7 @@ class H2OLlamaAttention(nn.Module):
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
+        # 先计算得到注意力分数
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
         past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
@@ -532,7 +571,6 @@ class H2OLlamaForCausalLM(LlamaForCausalLM):
         num_layers = len(self.model.layers)
         for layer_idx in range(num_layers):
             self.model.layers[layer_idx].self_attn = H2OLlamaAttention(config)
-
 
 
 ## H2O KV Cache dropping with Position rolling

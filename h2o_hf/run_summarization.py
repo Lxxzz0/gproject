@@ -79,6 +79,10 @@ if __name__ == '__main__':
     parser.add_argument("--hh_size", type=int, default=1024)
     parser.add_argument("--recent_size", type=int, default=1024)
 
+    # 默认是full
+    parser.add_argument("--hh_ratio", type=float, default=0)
+    parser.add_argument("--recent_ratio", type=float, default=1)
+
     parser.add_argument('--enable_h2o_cache', action='store_true')
 
     parser.add_argument("--sample_num", type=int, default=100)
@@ -111,6 +115,8 @@ if __name__ == '__main__':
         print('Enabling H2O KV cache')
         config.hh_size = args.hh_size
         config.recent_size = args.recent_size
+        config.hh_ratio = args.hh_ratio
+        config.recent_ratio = args.recent_ratio
         model = ENABLE_Heavy_Hitter_FUNCTIONS['llama_h2o'].from_pretrained(model_name, config=config,
                                                                             cache_dir=args.cache_dir)
     else:
@@ -136,6 +142,8 @@ if __name__ == '__main__':
     rougel_score_list = []
 
     all_rouge_scores_list = [[] for _ in range(3)]
+    
+    i = 0
 
     with torch.no_grad():
         for request in tqdm.tqdm(requests[:50]):
@@ -157,6 +165,8 @@ if __name__ == '__main__':
                 num_return_sequences=request['n'],
                 return_dict_in_generate=True, output_scores=True,
             )
+            # if i == 5:
+            #     print("this is", output_sequences['sequences'])
 
             if args.enable_h2o_cache:
                 for name, m in model.named_modules():
@@ -169,8 +179,25 @@ if __name__ == '__main__':
 
             generate_text = tokenizer.decode(output_sequences['sequences'].squeeze(0)[len(input_ids[0]):])
             generate_text = generate_text[: generate_text.find(stop[0])]
+            # if i == 5:
+            #     print("generate_text is", generate_text)
+            #     print(len(generate_text))
 
-            scores = rouge.get_scores(generate_text, label)[0]
+            # i += 1
+
+            # 计算 rouge 分数
+            # r: Recall（召回率）。
+            # p: Precision（精确率）。
+            # f: F1-score（F1 值）
+            # scores = rouge.get_scores(generate_text, label)[0]  # 只取第一个句子的分数
+            # rouge1_score_list.append(scores['rouge-1']['f'])
+            # rouge2_score_list.append(scores['rouge-2']['f'])
+            # rougel_score_list.append(scores['rouge-l']['f'])
+
+            scores = rouge.get_scores(generate_text, label, avg=True)
+            # 返回的是字典，有三个键：rouge-1、rouge-2、rouge-l
+            # 其中每个键对应的值是一个字典，包含了召回率、精确率和F1值
+            # 现在的方法是，对于每个样本，计算得到输出和答案的 rouge 分数，加到列表求目前已推理过样本的分数的平均值
             rouge1_score_list.append(scores['rouge-1']['f'])
             rouge2_score_list.append(scores['rouge-2']['f'])
             rougel_score_list.append(scores['rouge-l']['f'])
@@ -198,9 +225,9 @@ if __name__ == '__main__':
             all_rouge_scores_list[0].append(np.mean(rouge1_score_list))
             all_rouge_scores_list[1].append(np.mean(rouge2_score_list))
             all_rouge_scores_list[2].append(np.mean(rougel_score_list))
-            print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(np.mean(rouge1_score_list), np.mean(rouge2_score_list), np.mean(rougel_score_list)))
-
-    plot_all_scores(all_rouge_scores_list)
+            # print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(np.mean(rouge1_score_list), np.mean(rouge2_score_list), np.mean(rougel_score_list)))
+    print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(all_rouge_scores_list[0][-1], all_rouge_scores_list[1][-1], all_rouge_scores_list[2][-1]))
+    # plot_all_scores(all_rouge_scores_list)
 
     with open(output_path, 'w') as f:
         for result in results:

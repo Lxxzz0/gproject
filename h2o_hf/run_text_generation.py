@@ -146,7 +146,6 @@ def main():
     print("################## Generated Context with Full Cache ###################")
     print(result)
 
-
     ######### Enable HH
     model = model.to("cpu")
     checkpoint = copy.deepcopy(model.state_dict())

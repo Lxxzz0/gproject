@@ -16,7 +16,6 @@ from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
 
-# 要改动
 from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
@@ -723,7 +722,7 @@ class OptLM:
             l.set_task(task)
         self.hh_k = int(task.prompt_len * self.policy.hh_ratio)
 
-    # 让层调用自己的方法
+    # 下载模型权重，让层调用自己的方法
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(os.path.join(self.path, f"{self.config.name}-np")))
         check_path = os.path.join(expanded_path, "decoder.embed_positions.weight")

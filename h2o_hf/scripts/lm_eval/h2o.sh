@@ -14,17 +14,17 @@ export HF_HOME=${HF_CACHE}
 
 # ## Obtain inference data
 task=$1
-shots=5
-python -u generate_task_data.py --output-file ${TASK_DATA}/${task}-${shots}.jsonl --task-name ${task} --num-fewshot ${shots}
-
-## Inference, and generate output json file
 model=$2
 model_arch=$3
-python -u run_lm_eval_harness.py --input-path ${TASK_DATA}/${task}-${shots}.jsonl --output-path ${TASK_RESULTS}/${task}-${shots}-${model_arch}-h2o.jsonl --model-name ${model} --model-type ${model_arch} --heavy_ratio 0.1 --recent_ratio 0.1 --enable_small_cache
+method=$4
+shots=5
 
-## Evaluate results
-python -u evaluate_task_result.py --result-file ${TASK_RESULTS}/${task}-${shots}-${model_arch}-h2o.jsonl --task-name ${task} --num-fewshot ${shots} --model-type ${model_arch}
-
-
-
-
+if [ "$method" = "generate" ]; then
+    python -u generate_task_data_g.py --output-file ${TASK_DATA}/${task}-${shots}.jsonl --task-name ${task} --num-fewshot ${shots}
+    python -u run_lm_eval_harness_g.py --input-path ${TASK_DATA}/${task}-${shots}.jsonl --output-path ${TASK_RESULTS}/${task}-${shots}-${model_arch}-h2o.jsonl --model-name ${model} --model-type ${model_arch} --heavy_ratio 0.1 --recent_ratio 0.1 --enable_small_cache
+    python -u evaluate_task_result_g.py --result-file ${TASK_RESULTS}/${task}-${shots}-${model_arch}-h2o.jsonl --task-name ${task} --num-fewshot ${shots} --model-type ${model_arch}
+else
+    python -u generate_task_data.py --output-file ${TASK_DATA}/${task}-${shots}.jsonl --task-name ${task} --num-fewshot ${shots}
+    python -u run_lm_eval_harness.py --input-path ${TASK_DATA}/${task}-${shots}.jsonl --output-path ${TASK_RESULTS}/${task}-${shots}-${model_arch}-h2o.jsonl --model-name ${model} --model-type ${model_arch} --heavy_ratio 0.1 --recent_ratio 0.1 --enable_small_cache
+    python -u evaluate_task_result.py --result-file ${TASK_RESULTS}/${task}-${shots}-${model_arch}-h2o.jsonl --task-name ${task} --num-fewshot ${shots} --model-type ${model_arch}
+fi

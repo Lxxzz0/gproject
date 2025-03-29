@@ -1,5 +1,5 @@
 """
-The OPT model configurations and weight downloading utilities.
+The LLaMA model configurations and weight downloading utilities.
 
 Some functions are adopted from https://github.com/alpa-projects/alpa/tree/main/examples/llm_serving/model.
 """
@@ -8,43 +8,54 @@ import argparse
 import dataclasses
 import glob
 import os
-import shutil
 
 import numpy as np
 from tqdm import tqdm
 
 
+
 @dataclasses.dataclass(frozen=True)
 class LlamaConfig:
-    name: str = "opt-125m"
-    num_hidden_layers: int = 12
-    max_seq_len: int = 2048
-    hidden_size: int = 768
-    n_head: int = 12
-    input_dim: int = 768
-    ffn_embed_dim: int = 3072
+    name: str = "llama-7b"
+    num_hidden_layers: int = 32  # LLaMA-7B 的隐藏层数
+    max_seq_len: int = 2048  # 最大序列长度
+    hidden_size: int = 4096  # 隐藏层维度
+    n_head: int = 32  # 注意力头数
+    input_dim: int = 4096  # 输入维度，与 hidden_size 相同
+    intermediate_size: int = 11008  # 前馈网络的嵌入维度
     pad: int = 1
-    activation_fn: str = 'relu'
-    vocab_size: int = 50272
-    layer_norm_eps: float = 0.00001
-    pad_token_id: int = 1
-    dtype: type = np.float16
+    hidden_act: str = 'silu'  # LLaMA 使用 SiLU 激活函数
+    vocab_size: int = 32000  # LLaMA 的词汇表大小
+    rms_norm_eps: float = 1e-6  # LayerNorm 的 epsilon 值
+    pad_token_id: int = 0  # 通常 LLaMA 的 pad_token_id 为 0
+    dtype: type = np.float16  # 默认使用 float16
+    rope_theta=10000.0
+    type_vocab_size=2
+    max_position_embeddings: int = 2048
+    initializer_range: float = 0.02
+    tie_word_embeddings: bool = False
 
     def model_bytes(self):
-        h = self.input_dim
-        return 	2 * (self.num_hidden_layers * (
-        # self-attention
-        h * (3 * h + 1) + h * (h + 1) +
-        # mlp
-        h * (4 * h + 1) + h * 4 * (h + 1) +
-        # layer norm
-        h * 4) +
-        # embedding
-        self.vocab_size * (h + 1))
+        # 计算模型参数量
+        V = self.vocab_size
+        H = self.input_dim
+        L = self.num_hidden_layers
+        I = self.intermediate_size
+        # 有 l 层 transformers
+        # qkvo = 4 * h * h
+        # 两个线性层和偏置项 = 3 * h * i
+        # 两个归一化层 = 2 * h * i
+        # 词嵌入矩阵 = 2 * v * h
+        # 位置嵌入的参数 = h
+        # 参数都是 FP16 ，所以每个参数占用 2 个字节
+        num_params = L * (4 * H * H + 3 * I * H + 2 * H) + V * H * 2 + H
+        return num_params * 2 
 
+    # kv缓存的字节数
     def cache_bytes(self, batch_size, seq_len):
         return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * 2
 
+    # 隐藏层的字节数
     def hidden_bytes(self, batch_size, seq_len):
         return batch_size * seq_len * self.input_dim * 2
 
@@ -53,80 +64,14 @@ def get_llama_config(name, **kwargs):
     if "/" in name:
         name = name.split("/")[1]
     name = name.lower()
-
-    # Handle opt-iml-30b and opt-iml-max-30b
-    if "-iml-max" in name:
-        arch_name = name.replace("-iml-max", "")
-    elif "-iml" in name:
-        arch_name = name.replace("-iml", "")
-    else:
-        arch_name = name
+    arch_name = name
 
     if arch_name == "llama-7b":
-        config = LlamaConfig(name=name,
-            max_seq_len=2048, num_hidden_layers=12, n_head=12,
-            hidden_size=768, input_dim=768, ffn_embed_dim=768 * 4,
-        )
+        config = LlamaConfig(name=name, input_dim=4096, n_head=32, num_hidden_layers=32, intermediate_size=11008)
     else:
         raise ValueError(f"Invalid model name: {name}")
 
     return dataclasses.replace(config, **kwargs)
-
-
-def download_opt_weights_old(model_name, path):
-    """Download weights from huggingface."""
-    import torch
-    from transformers import OPTForCausalLM, BloomForCausalLM
-
-    if "/" in model_name:
-        model_name = model_name.split("/")[1].lower()
-    path = os.path.join(path, f"{model_name}-np")
-    path = os.path.abspath(os.path.expanduser(path))
-
-    if "opt" in model_name:
-        hf_model_name = "facebook/" + model_name
-        model_class = OPTForCausalLM
-    elif "bloom" in model_name:
-        hf_model_name = "bigscience/" + model_name
-        model_class = BloomForCausalLM
-    elif "galactica" in model_name:
-        hf_model_name = "facebook/" + model_name
-    else:
-        raise ValueError("Invalid model name: {model_name}")
-
-    print(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
-          f"The downloading and cpu loading can take dozens of minutes. "
-          f"If it seems to get stuck, you can monitor the progress by "
-          f"checking the memory usage of this process.")
-
-    disable_torch_init()
-    model = model_class.from_pretrained(hf_model_name, torch_dtype=torch.float16,
-                                        _fast_init=True)
-    restore_torch_init()
-
-    os.makedirs(path, exist_ok=True)
-
-    print(f"Convert the weights to numpy format under {path} ...")
-    if "opt" in model_name:
-        for name, param in tqdm(list(model.model.named_parameters())):
-            name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
-            param_path = os.path.join(path, name)
-            with open(param_path, "wb") as f:
-                np.save(f, param.cpu().detach().numpy())
-    elif "galactica" in model_name:
-        for name, param in tqdm(list(model.model.named_parameters())):
-            name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
-            param_path = os.path.join(path, name)
-            with open(param_path, "wb") as f:
-                np.save(f, param.cpu().detach().numpy())
-    elif "bloom" in model_name:
-        for name, param in tqdm(list(model.transformer.named_parameters())):
-            param_path = os.path.join(path, name)
-            with open(param_path, "wb") as f:
-                np.save(f, param.cpu().detach().numpy())
-    else:
-        raise ValueError("Invalid model name: {model_name}")
-
 
 global torch_linear_init_backup
 global torch_layer_norm_init_backup
@@ -154,17 +99,18 @@ def restore_torch_init():
     setattr(torch.nn.LayerNorm, "reset_parameters", torch_layer_norm_init_backup)
 
 
-def disable_hf_opt_init():
+# 禁用 Llama 模型的初始初始化 
+def disable_hf_llama_init():
     """
-    Disable the redundant default initialization to accelerate model creation.
+    Disable the redundant default initialization to accelerate model creation for LLaMA.
     """
     import transformers
 
-    setattr(transformers.models.opt.modeling_opt.OPTPreTrainedModel,
+    setattr(transformers.models.llama.modeling_llama.LlamaPreTrainedModel,
             "_init_weights", lambda *args, **kwargs: None)
 
 
-def download_opt_weights(model_name, path):
+def download_llama_weights(model_name, path):
     from huggingface_hub import snapshot_download
     import torch
 
@@ -173,13 +119,21 @@ def download_opt_weights(model_name, path):
           f"If it seems to get stuck, you can monitor the progress by "
           f"checking the memory usage of this process.")
 
-    if "opt" in model_name:
-        hf_model_name = "facebook/" + model_name
-    elif "galactica" in model_name:
-        hf_model_name = "facebook/" + model_name
+    if "llama" in model_name:
+        hf_model_name = "huggyllama/" + model_name
 
-    folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
-    bin_files = glob.glob(os.path.join(folder, "*.bin"))
+    # print(hf_model_name)
+    # print(3)
+    # # 使用 snapshot_download 从 Hugging Face 下载模型文件，只下载扩展名为 .bin 的文件（这些文件通常包含模型权重）
+    # folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
+    # print(folder)
+    # # 使用 glob 查找下载文件夹中所有的 .bin 文件
+    # bin_files = glob.glob(os.path.join(folder, "*.bin"))
+    # print(len(bin_files))   # 为0
+
+    # 修改 bin_files 为包含文件路径的列表
+    bin_files_dir = "/home/ubuntu/data/hf_cache/self_model_weights"
+    bin_files = glob.glob(os.path.join(bin_files_dir, "*.bin"))  # 获取目录下所有文件路径
 
     if "/" in model_name:
         model_name = model_name.split("/")[1].lower()
@@ -190,22 +144,19 @@ def download_opt_weights(model_name, path):
     for bin_file in tqdm(bin_files, desc="Convert format"):
         state = torch.load(bin_file)
         for name, param in tqdm(state.items(), leave=False):
+            # 替换文件名
             name = name.replace("model.", "")
-            name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
+            name = name.replace("final_layer_norm", "layer_norm")
             param_path = os.path.join(path, name)
             with open(param_path, "wb") as f:
                 np.save(f, param.cpu().detach().numpy())
 
-            # shared embedding
-            if "decoder.embed_tokens.weight" in name:
-                shutil.copy(param_path, param_path.replace(
-                    "decoder.embed_tokens.weight", "lm_head.weight"))
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str)
-    parser.add_argument("--path", type=str, default="~/opt_weights")
+    parser.add_argument("--model", type=str, default="llama-7b")
+    parser.add_argument("--path", type=str, default="/home/ubuntu/data/hf_cache/llama_weights")
     args = parser.parse_args()
 
-    download_opt_weights(args.model, args.path)
+    download_llama_weights(args.model, args.path)
+

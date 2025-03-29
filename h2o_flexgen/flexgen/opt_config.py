@@ -260,4 +260,4 @@ if __name__ == "__main__":
     parser.add_argument("--path", type=str, default="~/opt_weights")
     args = parser.parse_args()
 
-    download_opt_weights(args.model, args.path)
+    # download_opt_weights(args.model, args.path)

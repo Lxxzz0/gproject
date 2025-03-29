@@ -113,3 +113,8 @@ if __name__ == '__main__':
     with open(output_path, 'w') as f:
         for result in results:
             f.write(json.dumps(result) + '\n')
+
+    # 将结果写入输出文件
+    with open(output_path, 'w') as f:
+        for result in results:
+            f.write(json.dumps(result, ensure_ascii=False) + '\n')
