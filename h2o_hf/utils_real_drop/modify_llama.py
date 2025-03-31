@@ -266,14 +266,18 @@ class H2OKVCache_LayerWise:
         # hh-selection
         bsz, num_heads, _, head_dim = past_key_values[0].shape
 
-        # 在滑动窗口前选择 hh_size 个 token
-        select_hh_scores = self.hh_score[:, :seq_len - self.recent_size]
-        _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
-        keep_topk = keep_topk.sort().values
-        # i = 5
-        # for ii in range(i):
-        #     keep_topk[:, ii] = ii
+        i = 4
+        keep_i_past_k_token = past_key_values[0][:, :, : i, :]
+        keep_i_past_v_token = past_key_values[1][:, :, : i, :]
+        keep_i_hh_token = self.hh_score[:, : i]
 
+        # 在滑动窗口前选择 hh_size 个 token
+        select_hh_scores = self.hh_score[:, i:seq_len - self.recent_size]
+        _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
+        # pdb.set_trace()
+        keep_topk = keep_topk.sort().values
+        keep_topk += i
+        
         # pdb.set_trace()
 
         # 选择滑动窗口内的 token
@@ -281,10 +285,6 @@ class H2OKVCache_LayerWise:
         keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
         keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
         
-        i = 0
-        keep_i_past_k_token = past_key_values[0][:, :, : i, :]
-        keep_i_past_v_token = past_key_values[1][:, :, : i, :]
-        keep_i_hh_token = self.hh_score[:, : i]
         # print(i)
         
         mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
@@ -293,15 +293,12 @@ class H2OKVCache_LayerWise:
         # kv缓存的形状是[bsz, num_heads, seq_len, head_dim]
         k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
         v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-
         k_hh_recent = torch.cat([keep_i_past_k_token, k_hh_recent], dim=2)
         v_hh_recent = torch.cat([keep_i_past_v_token, v_hh_recent], dim=2)
 
         self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
         self.hh_score = torch.cat([keep_i_hh_token, self.hh_score], dim=1)
-
-        # self.cache_size -= count
-
+        
         return (k_hh_recent, v_hh_recent)
 
     def evict_for_space(self, past_key_values, num_coming):
