@@ -255,49 +255,103 @@ class H2OKVCache_LayerWise:
             self.cache_size = self.hh_size + self.recent_size
             # print(f"H2OKVCache-LayerWise: {self.hh_size}, {self.recent_size}")
         # pdb.set_trace()
-        self._update_hh_score(attn_score_cache)
 
-        if past_key_values is None:
-            return None
-        seq_len = past_key_values[0].size(self.k_seq_dim)
-        if seq_len <= self.cache_size:
-            return past_key_values
+        # 加个门限，防止 prefill 阶段的 kv_cache 过小
+        thershold = 200
 
-        # hh-selection
-        bsz, num_heads, _, head_dim = past_key_values[0].shape
+        if self.hh_size > 0:
+            self._update_hh_score(attn_score_cache)
 
-        i = 4
-        keep_i_past_k_token = past_key_values[0][:, :, : i, :]
-        keep_i_past_v_token = past_key_values[1][:, :, : i, :]
-        keep_i_hh_token = self.hh_score[:, : i]
+            if past_key_values is None:
+                return None
+            seq_len = past_key_values[0].size(self.k_seq_dim)
+            # if seq_len <= self.cache_size:
+            #     return past_key_values
+            
+            if seq_len < thershold:
+                return past_key_values
 
-        # 在滑动窗口前选择 hh_size 个 token
-        select_hh_scores = self.hh_score[:, i:seq_len - self.recent_size]
-        _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
-        # pdb.set_trace()
-        keep_topk = keep_topk.sort().values
-        keep_topk += i
-        
-        # pdb.set_trace()
+            # hh-selection
+            bsz, num_heads, _, head_dim = past_key_values[0].shape
 
-        # 选择滑动窗口内的 token
-        # keep_recent = torch.arange(seq_len - self.recent_size, seq_len).expand(keep_topk.shape[0], 1).to(keep_topk.device)
-        keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
-        keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
-        
-        # print(i)
-        
-        mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
-        mask = mask.scatter(-1, keep_idx, 1)
+            i = 3
+            keep_i_past_k_token = past_key_values[0][:, :, : i, :]
+            keep_i_past_v_token = past_key_values[1][:, :, : i, :]
+            keep_i_hh_token = self.hh_score[:, : i]
 
-        # kv缓存的形状是[bsz, num_heads, seq_len, head_dim]
-        k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-        v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-        k_hh_recent = torch.cat([keep_i_past_k_token, k_hh_recent], dim=2)
-        v_hh_recent = torch.cat([keep_i_past_v_token, v_hh_recent], dim=2)
+            # 在滑动窗口前选择 hh_size 个 token
+            select_hh_scores = self.hh_score[:, i:seq_len - self.recent_size]
+            _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
+            # pdb.set_trace()
+            keep_topk = keep_topk.sort().values
+            keep_topk += i
+            
+            # pdb.set_trace()
 
-        self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
-        self.hh_score = torch.cat([keep_i_hh_token, self.hh_score], dim=1)
+            # 选择滑动窗口内的 token
+            # keep_recent = torch.arange(seq_len - self.recent_size, seq_len).expand(keep_topk.shape[0], 1).to(keep_topk.device)
+            keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
+            keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
+            
+            # print(i)
+            
+            mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
+            mask = mask.scatter(-1, keep_idx, 1)
+
+            # kv缓存的形状是[bsz, num_heads, seq_len, head_dim]
+            k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+            v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+            k_hh_recent = torch.cat([keep_i_past_k_token, k_hh_recent], dim=2)
+            v_hh_recent = torch.cat([keep_i_past_v_token, v_hh_recent], dim=2)
+
+            self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
+            self.hh_score = torch.cat([keep_i_hh_token, self.hh_score], dim=1)
+
+        else:   # local 和 random，暂时写在一起，不想改结构
+            if past_key_values is None:
+                return None
+            seq_len = past_key_values[0].size(self.k_seq_dim)
+            if seq_len <= self.cache_size:
+                return past_key_values
+
+            # pdb.set_trace()
+
+            # hh-selection
+            bsz, num_heads, _, head_dim = past_key_values[0].shape
+
+            # local 方法
+            # 仅保留最近的 token
+            # keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=past_key_values[0].device)
+            # mask = torch.zeros(seq_len, dtype=torch.bool, device=past_key_values[0].device)
+            # mask[keep_recent] = True
+
+            # random 方法
+            # 随机保留 recent_size 个 token
+            # random_indices = torch.randperm(seq_len, device=past_key_values[0].device)[:self.recent_size]
+            # random_indices = random_indices.sort().values  # 保证索引按顺序排列，避免乱序影响后续操作
+
+            # mask = torch.zeros(seq_len, dtype=torch.bool, device=past_key_values[0].device)
+            # mask[random_indices] = True
+
+            # k_hh_recent = past_key_values[0][:, :, mask, :].contiguous()
+            # v_hh_recent = past_key_values[1][:, :, mask, :].contiguous()
+
+            # pdb.set_trace()
+
+            # 打算使用的方法
+            # local 方法
+            keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=past_key_values[0].device).repeat(num_heads, 1)
+            mask = torch.zeros((num_heads, seq_len), dtype=torch.bool).to(past_key_values[0].device)
+            mask = mask.scatter(-1, keep_recent, 1)
+
+            # random 方法
+            # keep_recent = torch.randperm(seq_len, device=past_key_values[0].device)[:self.recent_size].sort().values.repeat(num_heads, 1)
+            # # keep_recent = torch.arange(0, self.recent_size, device=past_key_values[0].device).repeat(num_heads, 1)
+            # mask = torch.zeros((num_heads, seq_len), dtype=torch.bool).to(past_key_values[0].device)
+            # mask = mask.scatter(-1, keep_recent, 1)
+
+            k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+            v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
         
         return (k_hh_recent, v_hh_recent)
 
@@ -347,6 +401,7 @@ class H2OKVCache_LayerWise:
 
     def _clean_scores(self):
         self.hh_score = None
+        self.cache_size = 0
 
 
 class H2OLlamaAttention(nn.Module):

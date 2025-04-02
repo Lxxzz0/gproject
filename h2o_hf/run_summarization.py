@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from rouge import Rouge
 import logging
 import numpy as np
+import pdb
 
 # from lost_in_the_middle.prompting import (
 #     Document,
@@ -154,7 +155,7 @@ if __name__ == '__main__':
             stop = request['stop']
 
             input_ids = tokenizer(prompt, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
-
+            print('input_ids_shape:', input_ids.shape)
             output_sequences = model.generate(
                 input_ids=input_ids,
                 max_length=request['max_tokens'] + len(input_ids[0]),
@@ -165,8 +166,6 @@ if __name__ == '__main__':
                 num_return_sequences=request['n'],
                 return_dict_in_generate=True, output_scores=True,
             )
-            # if i == 5:
-            #     print("this is", output_sequences['sequences'])
 
             if args.enable_h2o_cache:
                 for name, m in model.named_modules():
@@ -179,9 +178,7 @@ if __name__ == '__main__':
 
             generate_text = tokenizer.decode(output_sequences['sequences'].squeeze(0)[len(input_ids[0]):])
             generate_text = generate_text[: generate_text.find(stop[0])]
-            # if i == 5:
-            #     print("generate_text is", generate_text)
-            #     print(len(generate_text))
+            print((generate_text))
 
             # i += 1
 
@@ -189,11 +186,7 @@ if __name__ == '__main__':
             # r: Recall（召回率）。
             # p: Precision（精确率）。
             # f: F1-score（F1 值）
-            # scores = rouge.get_scores(generate_text, label)[0]  # 只取第一个句子的分数
-            # rouge1_score_list.append(scores['rouge-1']['f'])
-            # rouge2_score_list.append(scores['rouge-2']['f'])
-            # rougel_score_list.append(scores['rouge-l']['f'])
-
+            # pdb.set_trace()
             scores = rouge.get_scores(generate_text, label, avg=True)
             # 返回的是字典，有三个键：rouge-1、rouge-2、rouge-l
             # 其中每个键对应的值是一个字典，包含了召回率、精确率和F1值

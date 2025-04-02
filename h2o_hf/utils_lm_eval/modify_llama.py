@@ -56,13 +56,9 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget):
     # query和key的维度都要保留前heavy_budget个位置
     mask_bottom[:,:, padding_length:heavy_budget+padding_length, padding_length:heavy_budget+padding_length] = True
 
-    max_valid_index = accumulated_attention_score.shape[-1] - 1
-    for token_index in range(heavy_budget + padding_length, seq_length):
-        if token_index > max_valid_index:
-            break
     # 动态调整掩码：逐token选择重要位置
     # 这里的掩码会保留key的绝对位置，每个token都保留最重要的k个key的位置
-    # for token_index in range(heavy_budget+padding_length, seq_length):
+    for token_index in range(heavy_budget+padding_length, seq_length):
         # 计算当前 token 的注意力权重
         tmp_attn_index = nn.functional.softmax(attn_weights[:,:,token_index,:], dim=-1, dtype=torch.float32).to(dtype_attn_weights)
         
@@ -82,7 +78,6 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget):
         mask_bottom[:,:,token_index,:] = mask_bottom_index
         accumulated_attention_score += tmp_attn_index
         accumulated_attention_score = accumulated_attention_score * mask_bottom_index
-
 
     return mask_bottom
 

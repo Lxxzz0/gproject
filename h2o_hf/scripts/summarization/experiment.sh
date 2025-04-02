@@ -18,4 +18,4 @@ bash ./scripts/summarization/eval.sh xsum 3 h2o 0 0.2 0.1
 bash ./scripts/summarization/eval.sh xsum 3 full 3 0 1
 
 # local
-bash ./scripts/summarization/eval.sh xsum 3 local 3 0 0.2
+bash ./scripts/summarization/eval.sh xsum 3 h2o 3 0 0.2
