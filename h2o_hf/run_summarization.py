@@ -39,6 +39,17 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
+def plot_sample_num(input_h):
+    # 绘制直方图
+    plt.figure(figsize=(10, 6))
+    plt.hist(input_h, bins=20, color='blue', alpha=0.7, edgecolor='black')  # bins 控制直方图的分箱数量
+    plt.title("Distribution of Sample Lengths")
+    plt.xlabel("Sample Length")
+    plt.ylabel("Frequency")
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.show()
+    plt.savefig("/home/ubuntu/data/results/sample_length_distribution.png")
+
 
 ENABLE_Heavy_Hitter_FUNCTIONS = {
     "llama": None,
@@ -83,6 +94,7 @@ if __name__ == '__main__':
     # 默认是full
     parser.add_argument("--hh_ratio", type=float, default=0)
     parser.add_argument("--recent_ratio", type=float, default=1)
+    parser.add_argument("--keep_first", type=int, default=0)
 
     parser.add_argument('--enable_h2o_cache', action='store_true')
 
@@ -118,6 +130,7 @@ if __name__ == '__main__':
         config.recent_size = args.recent_size
         config.hh_ratio = args.hh_ratio
         config.recent_ratio = args.recent_ratio
+        config.keep_first = args.keep_first
         model = ENABLE_Heavy_Hitter_FUNCTIONS['llama_h2o'].from_pretrained(model_name, config=config,
                                                                             cache_dir=args.cache_dir)
     else:
@@ -141,13 +154,14 @@ if __name__ == '__main__':
     rouge1_score_list = []
     rouge2_score_list = []
     rougel_score_list = []
+    input_h = []
 
     all_rouge_scores_list = [[] for _ in range(3)]
     
     i = 0
 
     with torch.no_grad():
-        for request in tqdm.tqdm(requests[:50]):
+        for request in tqdm.tqdm(requests[:1]):
             result = {'request': request, 'result': {}}
             prompt = request['article']
             label = request['summary_gt']
@@ -155,7 +169,8 @@ if __name__ == '__main__':
             stop = request['stop']
 
             input_ids = tokenizer(prompt, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
-            print('input_ids_shape:', input_ids.shape)
+            input_h.append(input_ids.shape[1])
+
             output_sequences = model.generate(
                 input_ids=input_ids,
                 max_length=request['max_tokens'] + len(input_ids[0]),
@@ -165,6 +180,7 @@ if __name__ == '__main__':
                 do_sample=True,
                 num_return_sequences=request['n'],
                 return_dict_in_generate=True, output_scores=True,
+                use_cache=True,
             )
 
             if args.enable_h2o_cache:
@@ -221,6 +237,20 @@ if __name__ == '__main__':
             # print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(np.mean(rouge1_score_list), np.mean(rouge2_score_list), np.mean(rougel_score_list)))
     print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(all_rouge_scores_list[0][-1], all_rouge_scores_list[1][-1], all_rouge_scores_list[2][-1]))
     # plot_all_scores(all_rouge_scores_list)
+    # 打开文件并写入结果
+    # result_path = "/home/ubuntu/data/results/rouge_scores/keep_first.txt"
+    # with open(result_path, "a") as f:  # 使用 "a" 模式以追加内容
+    #     # 格式化结果字符串
+    #     result_str = '{}, rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}\n'.format(
+    #         args.keep_first,
+    #         all_rouge_scores_list[0][-1],
+    #         all_rouge_scores_list[1][-1],
+    #         all_rouge_scores_list[2][-1]
+    #     )
+    #     # 写入文件
+    #     f.write(result_str)
+
+    # plot_sample_num(input_h)
 
     with open(output_path, 'w') as f:
         for result in results:

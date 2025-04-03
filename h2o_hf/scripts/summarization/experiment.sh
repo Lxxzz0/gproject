@@ -12,10 +12,9 @@ bash ./scripts/summarization/eval.sh xsum 3 h2o 0 1024 1024
 
 # h2o
 bash ./scripts/summarization/eval.sh xsum 3 h2o 0 0.1 0.1
-bash ./scripts/summarization/eval.sh xsum 3 h2o 0 0.2 0.1
 
 # full
 bash ./scripts/summarization/eval.sh xsum 3 full 3 0 1
 
-# local
+# local and random，因为改动都是在 kv cache 剪枝的模块上做的，暂时没改其他参数
 bash ./scripts/summarization/eval.sh xsum 3 h2o 3 0 0.2

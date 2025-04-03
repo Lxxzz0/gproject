@@ -2,6 +2,7 @@ import math
 from typing import Optional, Tuple
 
 import pdb
+from matplotlib import pyplot as plt
 import torch
 from torch import nn
 import torch.utils.checkpoint
@@ -190,6 +191,32 @@ class LlamaConfig(PretrainedConfig):
             raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
 
 
+def plot_and_save_matrix(matrix, layer_idx, filename, title="Matrix"):
+    """
+    绘制形状为 (T, T) 的矩阵并保存图像
+    Args:
+        matrix (torch.Tensor): 形状为 (T, T) 的矩阵
+        filename (str): 保存图像的路径
+        title (str): 图像标题
+    """
+    # assert matrix.shape[0] == matrix.shape[1], "矩阵必须是方阵"
+
+    path = f"/home/ubuntu/data/results/images/layer{layer_idx}_{filename}"
+    title = f"{title} (Layer {layer_idx})"
+    
+    # 确保张量在CPU上
+    matrix = matrix.cpu().detach()
+
+    # 绘制矩阵
+    plt.imshow(matrix.numpy(), cmap='viridis')
+    plt.colorbar()
+    plt.title(title)
+    
+    # 保存图像
+    plt.savefig(path)
+    plt.close()
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -200,6 +227,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
 
 def _make_causal_mask(
     bsz: int, tgt_len: int, past_key_values_length: int, dtype: torch.dtype, device: torch.device):
@@ -235,6 +263,7 @@ class H2OKVCache_LayerWise:
         v_seq_dim=2,
         hh_ratio=0,
         recent_ratio=1,
+        keep_first=0,
     ):
         self.hh_ratio = hh_ratio
         self.recent_ratio = recent_ratio
@@ -245,6 +274,7 @@ class H2OKVCache_LayerWise:
         self.k_seq_dim = k_seq_dim
         self.v_seq_dim = v_seq_dim
         self.hh_score = None
+        self.keep_first = keep_first
         # print(f"H2OKVCache-LayerWise: {hh_size}, {recent_size}")
         
 
@@ -265,16 +295,15 @@ class H2OKVCache_LayerWise:
             if past_key_values is None:
                 return None
             seq_len = past_key_values[0].size(self.k_seq_dim)
-            # if seq_len <= self.cache_size:
-            #     return past_key_values
-            
-            if seq_len < thershold:
+            if seq_len <= self.cache_size:
                 return past_key_values
+            
+            # if seq_len < thershold:
+            #     return past_key_values
 
-            # hh-selection
             bsz, num_heads, _, head_dim = past_key_values[0].shape
 
-            i = 3
+            i = self.keep_first
             keep_i_past_k_token = past_key_values[0][:, :, : i, :]
             keep_i_past_v_token = past_key_values[1][:, :, : i, :]
             keep_i_hh_token = self.hh_score[:, : i]
@@ -307,51 +336,36 @@ class H2OKVCache_LayerWise:
             self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
             self.hh_score = torch.cat([keep_i_hh_token, self.hh_score], dim=1)
 
-        else:   # local 和 random，暂时写在一起，不想改结构
+        else:   # local 和 random，暂时写在一起，先不改结构
+            self._update_hh_score(attn_score_cache)
+
             if past_key_values is None:
                 return None
             seq_len = past_key_values[0].size(self.k_seq_dim)
             if seq_len <= self.cache_size:
                 return past_key_values
 
-            # pdb.set_trace()
-
-            # hh-selection
             bsz, num_heads, _, head_dim = past_key_values[0].shape
 
+            pdb.set_trace()
+
             # local 方法
-            # 仅保留最近的 token
-            # keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=past_key_values[0].device)
-            # mask = torch.zeros(seq_len, dtype=torch.bool, device=past_key_values[0].device)
-            # mask[keep_recent] = True
+            select_hh_scores = self.hh_score
+            _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
+            keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
+            keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
+            mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
+            mask = mask.scatter(-1, keep_idx, 1)
 
             # random 方法
-            # 随机保留 recent_size 个 token
-            # random_indices = torch.randperm(seq_len, device=past_key_values[0].device)[:self.recent_size]
-            # random_indices = random_indices.sort().values  # 保证索引按顺序排列，避免乱序影响后续操作
-
-            # mask = torch.zeros(seq_len, dtype=torch.bool, device=past_key_values[0].device)
-            # mask[random_indices] = True
-
-            # k_hh_recent = past_key_values[0][:, :, mask, :].contiguous()
-            # v_hh_recent = past_key_values[1][:, :, mask, :].contiguous()
-
-            # pdb.set_trace()
-
-            # 打算使用的方法
-            # local 方法
-            keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=past_key_values[0].device).repeat(num_heads, 1)
-            mask = torch.zeros((num_heads, seq_len), dtype=torch.bool).to(past_key_values[0].device)
-            mask = mask.scatter(-1, keep_recent, 1)
-
-            # random 方法
+            # torch.manual_seed(42)
             # keep_recent = torch.randperm(seq_len, device=past_key_values[0].device)[:self.recent_size].sort().values.repeat(num_heads, 1)
-            # # keep_recent = torch.arange(0, self.recent_size, device=past_key_values[0].device).repeat(num_heads, 1)
             # mask = torch.zeros((num_heads, seq_len), dtype=torch.bool).to(past_key_values[0].device)
             # mask = mask.scatter(-1, keep_recent, 1)
 
             k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
             v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+            self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
         
         return (k_hh_recent, v_hh_recent)
 
@@ -393,8 +407,6 @@ class H2OKVCache_LayerWise:
             self.hh_score = attn_score_cache.sum(0).sum(1)
         else:
             # 把分数累加到旧的 token 上
-            # if attn_score_cache.shape[1] - num_new_tokens > self.hh_score.shape[1]:
-            #     num_new_tokens = attn_score_cache.shape[1] - self.hh_score.shape[1]
             attn_score_cache = attn_score_cache.sum(0).sum(1)
             attn_score_cache[:, :-num_new_tokens] += self.hh_score
             self.hh_score = attn_score_cache
@@ -407,7 +419,7 @@ class H2OKVCache_LayerWise:
 class H2OLlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -417,6 +429,7 @@ class H2OLlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
+        self.layer_idx = layer_idx
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -434,6 +447,7 @@ class H2OLlamaAttention(nn.Module):
             recent_size=config.recent_size,
             hh_ratio=config.hh_ratio,
             recent_ratio=config.recent_ratio,
+            keep_first=config.keep_first,
             k_seq_dim=2,
             v_seq_dim=2,
         )
@@ -516,6 +530,8 @@ class H2OLlamaAttention(nn.Module):
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
+        # pdb.set_trace()
+
         query_states = query_states.view(
             bsz, q_len, self.num_heads, self.head_dim
         ).transpose(1, 2)
@@ -557,11 +573,14 @@ class H2OLlamaAttention(nn.Module):
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
+        # 更新KV Cache
         past_key_value = (key_states, value_states) if use_cache else None
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # pdb.set_trace()
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -581,6 +600,10 @@ class H2OLlamaAttention(nn.Module):
         # upcast attention to fp32
         # 先计算得到注意力分数
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # # 对第二个维度求和，绘制出来
+        # sum_attn_weights = torch.sum(attn_weights, dim=1)
+        # sum_attn_weights = nn.functional.softmax(sum_attn_weights, dim=-1, dtype=torch.float32).to(sum_attn_weights.dtype)
+        # plot_and_save_matrix(sum_attn_weights[0], self.layer_idx, "attn_weights.png", "Attention Weights")
 
         past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
 
@@ -621,8 +644,9 @@ class H2OLlamaForCausalLM(LlamaForCausalLM):
     def __init__(self, config):
         super().__init__(config)
         num_layers = len(self.model.layers)
+        # pdb.set_trace()
         for layer_idx in range(num_layers):
-            self.model.layers[layer_idx].self_attn = H2OLlamaAttention(config)
+            self.model.layers[layer_idx].self_attn = H2OLlamaAttention(config, layer_idx)
 
 
 ## H2O KV Cache dropping with Position rolling

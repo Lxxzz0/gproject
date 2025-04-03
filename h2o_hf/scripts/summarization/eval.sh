@@ -20,6 +20,7 @@ GPU=$4
 # RECENT_SIZE=$6
 hh_ratio=$5
 recent_ratio=$6
+keep_first=$7
 
 if [[ ${method} == 'h2o' ]]; then
     CUDA_VISIBLE_DEVICES=${GPU} python -u run_summarization.py \
@@ -29,6 +30,7 @@ if [[ ${method} == 'h2o' ]]; then
         --hh_ratio ${hh_ratio} \
         --recent_ratio ${recent_ratio} \
         --cache_dir ${HF_CACHE}  \
+        --keep_first ${keep_first} \
         --enable_h2o_cache
 elif [[ ${method} == 'full' ]]; then
     CUDA_VISIBLE_DEVICES=${GPU} python -u run_summarization.py \
@@ -44,5 +46,6 @@ else    # local
         --output_path summary_results/${task}_${shots}shot_local.jsonl \
         --model_name huggyllama/llama-7b \
         --cache_dir ${HF_CACHE} \
-        --recent_ratio ${recent_ratio}
+        --recent_ratio ${recent_ratio} \
+        --enable_h2o_cache
 fi
