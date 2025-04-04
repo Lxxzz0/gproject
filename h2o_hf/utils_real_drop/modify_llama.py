@@ -6,6 +6,7 @@ from matplotlib import pyplot as plt
 import torch
 from torch import nn
 import torch.utils.checkpoint
+import heapq
 
 import torch.nn.functional as F
 
@@ -254,6 +255,112 @@ def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
     return x_embed
 
 
+class LXSNAPKVCache_LayerWise:
+    def __init__(
+        self,
+        hh_size=8,
+        recent_size=512,
+        k_seq_dim=2,
+        v_seq_dim=2,
+        hh_ratio=0,
+        recent_ratio=1,
+        token_block_size=0,
+        window_size=0
+    ):
+        self.hh_ratio = hh_ratio
+        self.recent_ratio = recent_ratio
+        self.hh_size = hh_size
+        self.recent_size = recent_size
+        # self.cache_size = hh_size + recent_size
+        self.cache_size = 0
+        self.k_seq_dim = k_seq_dim
+        self.v_seq_dim = v_seq_dim
+        self.hh_score = None
+        self.token_block_size = token_block_size
+        self.window_size = window_size
+    
+    # baseline 就计算，
+    # 改进的方法是要计算，
+    def __call__(self, key_states, query_states, value_states, attention_mask):
+        self.window_size = 200
+        self.token_block_size = 50
+        # 计算注意力权重
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        # pdb.set_trace()
+        # 计算注意力权重，这里只计算了滑动窗口内的 token
+        attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
+        # 构造注意力掩码
+        # mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+        # mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        # mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        # mask = mask.to(attn_weights.device)
+        # attention_mask = mask[None, None, :, :]
+        # # 应用掩码
+        # attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # 先按 window_size 里的 token 来计算
+        # 每个历史 token 在所有查询 token 中的重要性
+        # attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)、
+        attn_weights_sum = attn_weights.sum(dim = -2)
+
+        self.kernel_size = 32
+        # attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+
+        # 选择 token block
+        # pdb.set_trace()
+        token_block_attn_weights_sum = []
+        token_block_count = self.window_size // self.token_block_size
+        # for i in range(token_block_count):
+        #     token_block_attn_weights_sum.append(
+        #         attn_weights[:,
+        #                      :,
+        #                      -(i + 1) * self.token_block_size: -i * self.token_block_size, 
+        #                      :]
+        #                     .sum(dim = -2) / attn_weights_sum
+        #     )
+        # 当前 token block 的注意力权重
+        for i in range(token_block_count):
+            # 对 token block 内的 token 求和，形状为 (batch_size, num_heads, seq_len)
+            token_block_weights = attn_weights[:, :, q_len - (i + 1) * self.token_block_size: q_len - i * self.token_block_size, :].sum(dim=-2)  
+            
+            # 当前 token block 的注意力权重占总注意力权重的比例
+            token_block_ratio = (token_block_weights / attn_weights_sum).sum(dim=-1)  # 对 seq_len 维度求和，形状为 (batch_size, num_heads)
+            
+            # 将比例（标量）添加到列表中
+            # token_block_attn_weights_sum.append(token_block_ratio.mean().item())  # 对 batch 和 heads 求平均，得到标量
+            token_block_attn_weights_sum.append(token_block_ratio.sum().item())
+
+        token_blocks = []
+        # 打包 token block 和重要性比例
+        for i in range(token_block_count):
+            token_blocks.append(
+                (
+                    (
+                        key_states[:, :, q_len - (i + 1) * self.token_block_size: q_len - i * self.token_block_size, :], 
+                        value_states[:, :, q_len - (i + 1) * self.token_block_size: q_len - i * self.token_block_size, :]
+                    ), 
+                token_block_attn_weights_sum[i]
+                )
+            )
+
+        return token_blocks
+
+        # # baseline，直接返回滑动窗口内的 token
+        # for i in range(token_block_count):
+        #     token_blocks.append(
+        #         (
+        #             (
+        #                 key_states[:, :, -self.window_size:, :], 
+        #                 value_states[:, :, -self.window_size:, :], 
+        #             ), 
+        #             0
+        #         )
+        #     )
+
+        # return token_blocks
+
+
 class H2OKVCache_LayerWise:
     def __init__(
         self,
@@ -286,23 +393,25 @@ class H2OKVCache_LayerWise:
             # print(f"H2OKVCache-LayerWise: {self.hh_size}, {self.recent_size}")
         # pdb.set_trace()
 
+        self._update_hh_score(attn_score_cache)
+
+        if past_key_values is None:
+            return None
+        seq_len = past_key_values[0].size(self.k_seq_dim)
+        if seq_len <= self.cache_size:
+            return past_key_values
+        
+        # if seq_len < thershold:
+        #     return past_key_values
+
+        bsz, num_heads, _, head_dim = past_key_values[0].shape
+
         # 加个门限，防止 prefill 阶段的 kv_cache 过小
         thershold = 200
 
+        # return past_key_values
+
         if self.hh_size > 0:
-            self._update_hh_score(attn_score_cache)
-
-            if past_key_values is None:
-                return None
-            seq_len = past_key_values[0].size(self.k_seq_dim)
-            if seq_len <= self.cache_size:
-                return past_key_values
-            
-            # if seq_len < thershold:
-            #     return past_key_values
-
-            bsz, num_heads, _, head_dim = past_key_values[0].shape
-
             i = self.keep_first
             keep_i_past_k_token = past_key_values[0][:, :, : i, :]
             keep_i_past_v_token = past_key_values[1][:, :, : i, :]
@@ -337,17 +446,7 @@ class H2OKVCache_LayerWise:
             self.hh_score = torch.cat([keep_i_hh_token, self.hh_score], dim=1)
 
         else:   # local 和 random，暂时写在一起，先不改结构
-            self._update_hh_score(attn_score_cache)
-
-            if past_key_values is None:
-                return None
-            seq_len = past_key_values[0].size(self.k_seq_dim)
-            if seq_len <= self.cache_size:
-                return past_key_values
-
-            bsz, num_heads, _, head_dim = past_key_values[0].shape
-
-            pdb.set_trace()
+            # pdb.set_trace()
 
             # local 方法
             select_hh_scores = self.hh_score
@@ -363,9 +462,13 @@ class H2OKVCache_LayerWise:
             # mask = torch.zeros((num_heads, seq_len), dtype=torch.bool).to(past_key_values[0].device)
             # mask = mask.scatter(-1, keep_recent, 1)
 
-            k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-            v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-            self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
+            k_hh_recent = past_key_values[0][:, :, :seq_len - 10, :]
+            v_hh_recent = past_key_values[1][:, :, :seq_len - 10, :]
+            self.hh_score= self.hh_score[:, :seq_len - 10]
+
+            # k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+            # v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+            # self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
         
         return (k_hh_recent, v_hh_recent)
 
@@ -448,6 +551,15 @@ class H2OLlamaAttention(nn.Module):
             hh_ratio=config.hh_ratio,
             recent_ratio=config.recent_ratio,
             keep_first=config.keep_first,
+            k_seq_dim=2,
+            v_seq_dim=2,
+        )
+
+        self.lx_snapkv_cache = LXSNAPKVCache_LayerWise(
+            hh_size=config.hh_size,
+            recent_size=config.recent_size,
+            hh_ratio=config.hh_ratio,
+            recent_ratio=config.recent_ratio,
             k_seq_dim=2,
             v_seq_dim=2,
         )
@@ -605,7 +717,8 @@ class H2OLlamaAttention(nn.Module):
         # sum_attn_weights = nn.functional.softmax(sum_attn_weights, dim=-1, dtype=torch.float32).to(sum_attn_weights.dtype)
         # plot_and_save_matrix(sum_attn_weights[0], self.layer_idx, "attn_weights.png", "Attention Weights")
 
-        past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
+        # past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
+        past_key_value = self.lx_snapkv_cache(key_states, query_states, value_states, attention_mask)
 
         attn_output = torch.matmul(attn_weights, value_states)
 

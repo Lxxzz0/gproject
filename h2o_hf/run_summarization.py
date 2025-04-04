@@ -161,7 +161,7 @@ if __name__ == '__main__':
     i = 0
 
     with torch.no_grad():
-        for request in tqdm.tqdm(requests[:1]):
+        for request in tqdm.tqdm(requests[:50]):
             result = {'request': request, 'result': {}}
             prompt = request['article']
             label = request['summary_gt']
@@ -170,6 +170,8 @@ if __name__ == '__main__':
 
             input_ids = tokenizer(prompt, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
             input_h.append(input_ids.shape[1])
+
+            # pdb.set_trace()
 
             output_sequences = model.generate(
                 input_ids=input_ids,
