@@ -347,7 +347,7 @@ class H2OKVCache_LayerWise:
 
             bsz, num_heads, _, head_dim = past_key_values[0].shape
 
-            pdb.set_trace()
+            # pdb.set_trace()
 
             # local 方法
             select_hh_scores = self.hh_score
