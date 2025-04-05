@@ -268,9 +268,9 @@ def eval_task(model, tokenizer,args, task_type="xsum"):
     score = scorer(task_type, predictions,answers, all_classes)
     print(f"dataset {task_type} method {args.method} scores {score}")
 
-    
+# 使用方法参考
 # bash scripts/summarization/eval.sh xsum 3 h2o 5 0.1 0.1 0
-# bash scripts/summarization/eval.sh xsum 3 h2o 5 0.1 0.1 0
+# bash scripts/summarization/eval.sh xsum 3 narrativeqa 5 0.1 0.1 0
 
 if __name__ == '__main__':
 
