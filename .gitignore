@@ -4,6 +4,8 @@
 *.swp
 *__pycache__
 *.egg-info
+h2o_hf/tmp
+
 
 # built binaries
 benchmark/third_party/pagecache-mangagement/trunk/fadv
