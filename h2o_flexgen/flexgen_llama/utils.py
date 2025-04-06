@@ -30,6 +30,7 @@ class Task:
     do_sample: bool
     temperature: float
     stop: Optional[int]
+    top_p: float
 
 
 @dataclasses.dataclass(frozen=True)

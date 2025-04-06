@@ -279,12 +279,11 @@ class OutputEmbed:
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_ln, b_ln, w_token = weight_home.val
+        w_ln, lm_head = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
-            weight_read_buf.store((w_ln.smart_copy(dst2), b_ln.smart_copy(dst2),
-                w_token.smart_copy(dst1)))
+            weight_read_buf.store((w_ln.smart_copy(dst2), lm_head.smart_copy(dst1)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -305,14 +304,12 @@ class OutputEmbed:
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            (w_ln, donate[1]), (b_ln, donate[2]), (w_token, donate[3]) = weight_read_buf.pop()
+            (w_ln, donate[1]), (lm_head, donate[3]) = weight_read_buf.pop()
         else:
-            (w_ln, _), (b_ln, _), (w_token, _) = weight_read_buf.val
+            (w_ln, _), (lm_head, _) = weight_read_buf.val
 
-        # print(h.data[0, 0, :5])
-        h = self.compute.llama_output_embed(h, w_ln, b_ln, w_token, donate,
-                                            self.task.do_sample, self.task.temperature)
-        # print(h.data)
+        h = self.compute.llama_output_embed(h, w_ln, donate,
+            self.task.do_sample, self.task.temperature, lm_head, self.task.top_p)
         hidden.val = h
 
 
@@ -419,7 +416,7 @@ class SelfAttention:
         if i == 0:  # prefill, no cache
             return
 
-        k_home, v_home, acc = cache_home.val
+        k_home, v_home = cache_home.val
 
         # Pick code path
         if self.policy.compress_cache:
@@ -428,7 +425,7 @@ class SelfAttention:
         else:
             if self.policy.cpu_cache_compute:
                 if (k_home.device.device_type == DeviceType.MIXED and
-                    k_home.data[0][0] is not None):
+                        k_home.data[0][0] is not None):
                     path = 2
                 else:
                     path = 1
@@ -436,21 +433,15 @@ class SelfAttention:
                 path = 0
             dst = self.attention_compute
 
-        pos = min(self.hh_k * 2 - 1, self.task.prompt_len) + 1
         if path == 0:  # Direct copy
             # shape: (s, b * n_head, head_dim)
-            if self.policy.hh_all:
-                indices = (slice(0, pos),
-                           slice(0, k_home.shape[1]))
-            else:
-                indices = (slice(0, pos + i),
-                           slice(0, k_home.shape[1]))
+            indices = (slice(0, self.task.prompt_len + i),
+                       slice(0, k_home.shape[1]))
 
             if self.policy.attn_sparsity >= 1.0:
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     v_home.smart_copy(dst, indices),
-                    acc.smart_copy(dst, indices),
                 ))
             else:
                 cache_read_buf.store((
@@ -459,20 +450,14 @@ class SelfAttention:
                 ))
         elif path == 1:  # Copy to CPU temporary workspace
             # shape: (s, b * n_head, head_dim)
-            k_buf, v_buf, acc_buf = dst.next_attention_compute_workspace()
-            if self.policy.hh_all:
-                indices = (slice(0, pos),
-                           slice(0, k_home.shape[1]))
-            else:
-                indices = (slice(0, pos + i),
-                           slice(0, k_home.shape[1]))
-
+            k_buf, v_buf = dst.next_attention_compute_workspace()
+            indices = (slice(0, self.task.prompt_len + i - 1),
+                       slice(0, k_home.shape[1]))
             general_copy(k_buf, indices, k_home, indices)
 
             if self.policy.attn_sparsity >= 1.0:
                 general_copy(v_buf, indices, v_home, indices)
-                general_copy(acc_buf, indices, acc, indices)
-                cache_read_buf.store(((k_buf, False), (v_buf, False), (acc_buf, False)))
+                cache_read_buf.store(((k_buf, False), (v_buf, False)))
             else:
                 cache_read_buf.store(((k_buf, False), ((v_home, v_buf), False)))
         elif path == 2:  # Copy to both GPU and CPU
@@ -484,7 +469,7 @@ class SelfAttention:
 
             # shape: (s, b * n_head, head_dim)
             k_buf, v_buf = dst.next_attention_compute_workspace()
-            indices = (slice(0, pos + i - 1),
+            indices = (slice(0, self.task.prompt_len + i - 1),
                        slice(gpu_k_buf.shape[1], k_home.shape[1]))
             general_copy(k_buf, indices, k_home, indices)
             general_copy(v_buf, indices, v_home, indices)
@@ -907,6 +892,7 @@ class LlamaLM:
                  stop: Optional[int] = None,
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
+                 top_p: float = 0.9,
                  verbose: int = 0):
         task = Task(
             inputs=inputs,
@@ -916,6 +902,7 @@ class LlamaLM:
             do_sample=do_sample,
             temperature=temperature,
             stop=stop,
+            top_p=top_p
         )
         num_layers = self.num_layers
         num_gpu_batches = self.num_gpu_batches

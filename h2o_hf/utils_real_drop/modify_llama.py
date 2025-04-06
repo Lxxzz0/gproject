@@ -398,18 +398,19 @@ class H2OKVCache_LayerWise:
         if past_key_values is None:
             return None
         seq_len = past_key_values[0].size(self.k_seq_dim)
+
+        # 加个门限，防止 prefill 阶段的 kv_cache 过小
+        thershold = 0
         if seq_len <= self.cache_size:
             return past_key_values
         
         # if seq_len < thershold:
         #     return past_key_values
 
-        bsz, num_heads, _, head_dim = past_key_values[0].shape
-
-        # 加个门限，防止 prefill 阶段的 kv_cache 过小
-        thershold = 200
-
+        # full，直接返回所有kvcache
         # return past_key_values
+
+        bsz, num_heads, _, head_dim = past_key_values[0].shape
 
         if self.hh_size > 0:
             i = self.keep_first
@@ -420,11 +421,8 @@ class H2OKVCache_LayerWise:
             # 在滑动窗口前选择 hh_size 个 token
             select_hh_scores = self.hh_score[:, i:seq_len - self.recent_size]
             _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
-            # pdb.set_trace()
             keep_topk = keep_topk.sort().values
             keep_topk += i
-            
-            # pdb.set_trace()
 
             # 选择滑动窗口内的 token
             # keep_recent = torch.arange(seq_len - self.recent_size, seq_len).expand(keep_topk.shape[0], 1).to(keep_topk.device)
@@ -462,13 +460,9 @@ class H2OKVCache_LayerWise:
             # mask = torch.zeros((num_heads, seq_len), dtype=torch.bool).to(past_key_values[0].device)
             # mask = mask.scatter(-1, keep_recent, 1)
 
-            k_hh_recent = past_key_values[0][:, :, :seq_len - 10, :]
-            v_hh_recent = past_key_values[1][:, :, :seq_len - 10, :]
-            self.hh_score= self.hh_score[:, :seq_len - 10]
-
-            # k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-            # v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-            # self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
+            k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+            v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+            self.hh_score= self.hh_score[mask].view(num_heads, self.cache_size)
         
         return (k_hh_recent, v_hh_recent)
 
@@ -717,8 +711,8 @@ class H2OLlamaAttention(nn.Module):
         # sum_attn_weights = nn.functional.softmax(sum_attn_weights, dim=-1, dtype=torch.float32).to(sum_attn_weights.dtype)
         # plot_and_save_matrix(sum_attn_weights[0], self.layer_idx, "attn_weights.png", "Attention Weights")
 
-        # past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
-        past_key_value = self.lx_snapkv_cache(key_states, query_states, value_states, attention_mask)
+        past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
+        # past_key_value = self.lx_snapkv_cache(key_states, query_states, value_states, attention_mask)
 
         attn_output = torch.matmul(attn_weights, value_states)
 

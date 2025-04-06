@@ -415,27 +415,26 @@ class TorchDevice:
         # # 位置编码在注意力层通过RoPE计算
         # return TorchTensor.create_from_torch(token_embed, self), position_embeddings
 
-    def llama_output_embed(self, inputs, w_ln, b_ln, w_token, donate,
-                         do_sample, temperature):
+    def llama_output_embed(self, inputs, w_ln, donate,
+                         do_sample, temperature, lm_head, top_p):
         # decompress weights
-        if w_token.device.device_type == DeviceType.COMPRESSED:
-            w_token = w_token.device.decompress(w_token)
+        if lm_head.device.device_type == DeviceType.COMPRESSED:
+            lm_head = lm_head.device.decompress(lm_head)
 
         b, s, h = inputs.shape
-
-        # 归一化
-        norm = LlamaRMSNorm(h)
-        hidden = norm(h)
-        # hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        # hidden = inputs.data
+        hidden = rms_norm(inputs.data, w_ln.data)
+        # hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data)
         if donate[0]: inputs.delete()
 
         # output embedding
-        logits = F.linear(hidden, w_token.data)
+        logits = F.linear(hidden, lm_head.data)
         last_token_logits = logits[:,-1,:]
 
         if do_sample and not temperature < 1e-5:
             probs = torch.softmax(last_token_logits / temperature, dim=-1)
             ids = torch.multinomial(probs, num_samples=1)
+            # ids = sample_top_p(probs, top_p)
         else:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
@@ -725,7 +724,7 @@ class TorchDevice:
         # shape: (b * n_head, 1, s)
         attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head)
         # shape: (b, n_head, 1, head_dim)
-        return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim), attn_weights
+        return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
 
     def _sparse_attention_value(self, q, k, v_new, v_cache, mask, b,
                                 src_s, tgt_s, n_head, head_dim, attn_sparsity):
