@@ -285,10 +285,10 @@ class LXSNAPKVCache_LayerWise:
         self.window_size = 200
         self.token_block_size = 50
         # 计算注意力权重
-        bsz, num_heads, q_len, head_dim = query_states.shape
+        bsz, num_heads, q_len, head_dim = key_states.shape
         # pdb.set_trace()
         # 计算注意力权重，这里只计算了滑动窗口内的 token
-        attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
         # 构造注意力掩码
         # mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
         # mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
@@ -302,15 +302,15 @@ class LXSNAPKVCache_LayerWise:
         # 先按 window_size 里的 token 来计算
         # 每个历史 token 在所有查询 token 中的重要性
         # attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)、
-        attn_weights_sum = attn_weights.sum(dim = -2)
+        attn_weights_sum = attn_weights.sum(dim = -2).sum(dim = -1)
 
-        self.kernel_size = 32
+        # self.kernel_size = 32
         # attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
 
         # 选择 token block
         # pdb.set_trace()
         token_block_attn_weights_sum = []
-        token_block_count = self.window_size // self.token_block_size
+        token_block_count = q_len // self.token_block_size
         # for i in range(token_block_count):
         #     token_block_attn_weights_sum.append(
         #         attn_weights[:,
@@ -322,10 +322,11 @@ class LXSNAPKVCache_LayerWise:
         # 当前 token block 的注意力权重
         for i in range(token_block_count):
             # 对 token block 内的 token 求和，形状为 (batch_size, num_heads, seq_len)
+            # 求 token block 内的 token 在全局范围的的注意力权重
             token_block_weights = attn_weights[:, :, q_len - (i + 1) * self.token_block_size: q_len - i * self.token_block_size, :].sum(dim=-2)  
             
             # 当前 token block 的注意力权重占总注意力权重的比例
-            token_block_ratio = (token_block_weights / attn_weights_sum).sum(dim=-1)  # 对 seq_len 维度求和，形状为 (batch_size, num_heads)
+            token_block_ratio = (token_block_weights.sum(dim = -1) / attn_weights_sum)  # 对 seq_len 维度求和，形状为 (batch_size, num_heads)
             
             # 将比例（标量）添加到列表中
             # token_block_attn_weights_sum.append(token_block_ratio.mean().item())  # 对 batch 和 heads 求平均，得到标量
@@ -333,6 +334,18 @@ class LXSNAPKVCache_LayerWise:
 
         token_blocks = []
         # 打包 token block 和重要性比例
+        # for i in range(token_block_count):
+        #     token_blocks.append(
+        #         (
+        #             (
+        #                 key_states[:, :, q_len - (i + 1) * self.token_block_size: q_len - i * self.token_block_size, :], 
+        #                 value_states[:, :, q_len - (i + 1) * self.token_block_size: q_len - i * self.token_block_size, :]
+        #             ), 
+        #             token_block_attn_weights_sum[i]
+        #         )
+        #     )
+
+        # baseline，直接返回滑动窗口内的 token
         for i in range(token_block_count):
             token_blocks.append(
                 (
@@ -340,25 +353,11 @@ class LXSNAPKVCache_LayerWise:
                         key_states[:, :, q_len - (i + 1) * self.token_block_size: q_len - i * self.token_block_size, :], 
                         value_states[:, :, q_len - (i + 1) * self.token_block_size: q_len - i * self.token_block_size, :]
                     ), 
-                token_block_attn_weights_sum[i]
+                    i
                 )
             )
 
         return token_blocks
-
-        # # baseline，直接返回滑动窗口内的 token
-        # for i in range(token_block_count):
-        #     token_blocks.append(
-        #         (
-        #             (
-        #                 key_states[:, :, -self.window_size:, :], 
-        #                 value_states[:, :, -self.window_size:, :], 
-        #             ), 
-        #             0
-        #         )
-        #     )
-
-        # return token_blocks
 
 
 class H2OKVCache_LayerWise:
@@ -382,6 +381,7 @@ class H2OKVCache_LayerWise:
         self.v_seq_dim = v_seq_dim
         self.hh_score = None
         self.keep_first = keep_first
+        self.threshold = 0
         # print(f"H2OKVCache-LayerWise: {hh_size}, {recent_size}")
         
 
@@ -400,12 +400,13 @@ class H2OKVCache_LayerWise:
         seq_len = past_key_values[0].size(self.k_seq_dim)
 
         # 加个门限，防止 prefill 阶段的 kv_cache 过小
-        thershold = 0
+        if self.threshold == 0:
+            self.threshold = attn_score_cache.shape[2] * 0.5
         if seq_len <= self.cache_size:
             return past_key_values
         
-        # if seq_len < thershold:
-        #     return past_key_values
+        if seq_len < self.threshold:
+            return past_key_values
 
         # full，直接返回所有kvcache
         # return past_key_values
@@ -414,6 +415,7 @@ class H2OKVCache_LayerWise:
 
         if self.hh_size > 0:
             i = self.keep_first
+            print(i)
             keep_i_past_k_token = past_key_values[0][:, :, : i, :]
             keep_i_past_v_token = past_key_values[1][:, :, : i, :]
             keep_i_hh_token = self.hh_score[:, : i]
@@ -447,18 +449,18 @@ class H2OKVCache_LayerWise:
             # pdb.set_trace()
 
             # local 方法
-            select_hh_scores = self.hh_score
-            _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
-            keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
-            keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
-            mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
-            mask = mask.scatter(-1, keep_idx, 1)
+            # select_hh_scores = self.hh_score
+            # _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
+            # keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
+            # keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
+            # mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
+            # mask = mask.scatter(-1, keep_idx, 1)
 
             # random 方法
-            # torch.manual_seed(42)
-            # keep_recent = torch.randperm(seq_len, device=past_key_values[0].device)[:self.recent_size].sort().values.repeat(num_heads, 1)
-            # mask = torch.zeros((num_heads, seq_len), dtype=torch.bool).to(past_key_values[0].device)
-            # mask = mask.scatter(-1, keep_recent, 1)
+            torch.manual_seed(42)
+            keep_recent = torch.randperm(seq_len, device=past_key_values[0].device)[:self.recent_size].sort().values.repeat(num_heads, 1)
+            mask = torch.zeros((num_heads, seq_len), dtype=torch.bool).to(past_key_values[0].device)
+            mask = mask.scatter(-1, keep_recent, 1)
 
             k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
             v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
@@ -495,7 +497,6 @@ class H2OKVCache_LayerWise:
         return (k_hh_recent, v_hh_recent)
 
     def _update_hh_score(self, attn_score_cache):
-        # pdb.set_trace()
         # 新增的 token 数
         num_new_tokens = attn_score_cache.shape[2]
 
@@ -511,6 +512,7 @@ class H2OKVCache_LayerWise:
     def _clean_scores(self):
         self.hh_score = None
         self.cache_size = 0
+        self.threshold = 0
 
 
 class H2OLlamaAttention(nn.Module):
@@ -711,8 +713,8 @@ class H2OLlamaAttention(nn.Module):
         # sum_attn_weights = nn.functional.softmax(sum_attn_weights, dim=-1, dtype=torch.float32).to(sum_attn_weights.dtype)
         # plot_and_save_matrix(sum_attn_weights[0], self.layer_idx, "attn_weights.png", "Attention Weights")
 
-        past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
-        # past_key_value = self.lx_snapkv_cache(key_states, query_states, value_states, attention_mask)
+        # past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
+        past_key_value = self.lx_snapkv_cache(key_states, query_states, value_states, attention_mask)
 
         attn_output = torch.matmul(attn_weights, value_states)
 

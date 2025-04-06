@@ -468,7 +468,7 @@ class TorchDevice:
     # 注意力层计算（预填充阶段）
     def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, 
                   w_out, n_head, donate, compress_cache, comp_config, 
-                  input_layernorm, rotary_emb_inv_freq):
+                  input_layernorm, rotary_emb_inv_freq, hh_k):
         """Multi-head attention (prefill phase)."""
 
         # decompress weights
@@ -481,15 +481,12 @@ class TorchDevice:
         # 批次大小，序列长度，隐藏维度
         bsz, q_len, h = hidden_states.shape
 
+        # 传递归一化层的参数来归一化输入
+        hidden = rms_norm(hidden_states.data, input_layernorm.data)
+
         head_dim = h // n_head
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data)
         scaling = head_dim ** -0.5
-        hidden = rms_norm(hidden_states.data, input_layernorm.data)
-
-        # 传递归一化层的参数来归一化输入
-        # norm = LlamaRMSNorm(h)
-        # hidden = norm(h)
-        # hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
 
         q = F.linear(hidden, w_q.data) * scaling
         k = F.linear(hidden, w_k.data)
@@ -541,6 +538,8 @@ class TorchDevice:
         k = k.permute(2, 0, 1)
         v = v.permute(1, 0, 2)
 
+        k, v = self._heavy_hitter_pruning(k, v, attn_weights, hh_k)
+
         if compress_cache:
             k = self.compressed_device.compress(k, comp_config)
             v = self.compressed_device.compress(v, comp_config)
@@ -554,7 +553,7 @@ class TorchDevice:
     # 中间层计算
     def mha_gen_llama(self, inputs, attention_mask, w_q, w_k, w_v,
                 w_out, n_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq):
+                attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, hh_k):
         """Multi-head attention (decoding phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -640,6 +639,8 @@ class TorchDevice:
 
         value.add_(inputs.data)
 
+        k, v = self._heavy_hitter_pruning(k, v, attn_weights, hh_k)
+
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
@@ -655,6 +656,7 @@ class TorchDevice:
             v_new = TorchTensor.create_from_torch(v_new, self)
 
         return TorchTensor.create_from_torch(value, self), k_new, v_new
+
 
     def _get_light_hitter(self, acc):
         # return torch.zeros(attn_weights.shape[0])
@@ -675,8 +677,7 @@ class TorchDevice:
 
         aggr_attn = torch.sum(attn_weights, 1)
         # (b * n_head, hh_k)
-        _, topk_indices = aggr_attn[:, :-hh_k + 1].topk(
-            min(hh_k, aggr_attn.shape[1] - hh_k + 1), dim=1)
+        _, topk_indices = aggr_attn[:, :-hh_k + 1].topk(min(hh_k, aggr_attn.shape[1] - hh_k + 1), dim=1)
         # topk_indices, _ = topk_indices.sort()
         # print("topk_indices", topk_indices.shape, topk_indices)
 
@@ -695,13 +696,7 @@ class TorchDevice:
         # (hh_k * 2, b * n_head, head_dim)
         k = torch.cat([k_hh, k[-hh_k + 1:]], dim=0)
         v = torch.cat([v_hh, v[-hh_k + 1:]], dim=0)
-        # new shape (hh_k, b * n_head)
-        aggr_attn = aggr_attn.transpose(0, 1)
-        dim1_indices = torch.arange(aggr_attn.size(1)).unsqueeze(0)
-        # (hh_k * 2, b * n_head)
-        acc_hh = aggr_attn[topk_indices.transpose(0, 1), dim1_indices]
-        acc = torch.cat([acc_hh, aggr_attn[-hh_k + 1:]], dim=0)
-        return k, v, acc
+        return k, v
 
 
     def _attention_weights(self, q, k, mask, b, src_s, n_head):

@@ -3,3 +3,5 @@ peak gpu mem: 4.404 GB	projected: False
 prefill latency: 2.133 s	prefill throughput: 3840.236 token/s
 decode latency: 27.671 s	decode throughput: 4.481 token/s
 total latency: 29.804 s	total throughput: 4.295 token/s
+
+python flex_llama.py --gpu-batch-size 64 --overlap false --model huggyllama/llama-7b

@@ -358,7 +358,7 @@ class SelfAttention:
 
     def set_task(self, task):
         self.task = task
-        # self.hh_k = int(task.prompt_len * self.policy.hh_ratio)
+        self.hh_k = int(task.prompt_len * self.policy.hh_ratio)
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
@@ -550,8 +550,9 @@ class SelfAttention:
             # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
-                                                            n_head, donate, self.policy.compress_cache, self.policy.comp_cache_config, 
-                                                            input_layernorm, rotary_emb_inv_freq)
+                                                            n_head, donate, self.policy.compress_cache, 
+                                                            self.policy.comp_cache_config, 
+                                                            input_layernorm, rotary_emb_inv_freq, self.hh_k)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:
             # decoding
@@ -563,7 +564,8 @@ class SelfAttention:
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 input_layernorm,
-                rotary_emb_inv_freq)
+                rotary_emb_inv_freq, 
+                self.hh_k)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h

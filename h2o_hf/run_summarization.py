@@ -190,6 +190,7 @@ def eval_task(model, tokenizer,args, task_type="xsum"):
     # input,context,answers,length,dataset,language,all_classes,_id
     # 或者是 request: {article,summary_gt,logprobs,max_tokens,model,n,prompt,request_type,stop,temperature,top_p,scenario,}
     prompts =[]
+    len_prompt = []
 
     with open(args.data_file, 'r') as f:
         for line in f:
@@ -203,6 +204,7 @@ def eval_task(model, tokenizer,args, task_type="xsum"):
                     example["answers"] = [example["summary_gt"]]
                 template = model2prompt[task_type]
                 prompt = template.format(**example)
+                len_prompt.append(len(prompt))
                 # length = example["length"]
                 # if length > input_max_len: input_max_len = length
                 if "llama2" in args.model_name.lower():
@@ -210,6 +212,7 @@ def eval_task(model, tokenizer,args, task_type="xsum"):
                 example["prompt"] = prompt
                 requests.append(example)
                 prompts.append(example["prompt"])
+    plot_sample_num(len_prompt)
 
     print(len(requests))
     if args.sample_num < len(requests):

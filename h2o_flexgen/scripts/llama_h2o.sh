@@ -17,7 +17,13 @@ export PYTHONPATH=$PYTHONPATH:~/data/H2O-main/h2o_flexgen
 # python flex_llama.py --gpu-batch-size 1 --overlap false --hh-ratio 0.3 --hh-all --model facebook/opt-6.7b --compress-weight
 
 # flexgen
-python flex_llama.py --gpu-batch-size 64 --overlap false --model huggyllama/llama-7b
+# python flex_llama.py --gpu-batch-size 64 --overlap false --model huggyllama/llama-7b
+
+python flex_llama.py --gpu-batch-size 32 --overlap false --model huggyllama/llama-7b --hh-ratio 0.1
+
+python flex_llama.py --gpu-batch-size 32 --overlap false --model huggyllama/llama-7b --hh-ratio 0.2
+
+python flex_llama.py --gpu-batch-size 32 --overlap false --model huggyllama/llama-7b --hh-ratio 0.3
 
 # h2o
 # python flex_llama.py --gpu-batch-size 1 --overlap false --hh-ratio 0.1 --hh-all --model facebook/opt-6.7b
