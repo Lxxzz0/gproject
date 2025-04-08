@@ -369,7 +369,7 @@ class LXSNAPKVCache_LayerWise:
             # token_block_attn_weights_sum.append(token_block_ratio.mean().item())  # 对 batch 和 heads 求平均，得到标量
             token_block_attn_weights_sum.append(token_block_ratio.sum().item())
 
-        # reversed(token_block_attn_weights_sum)
+        # 加了反转，之前都拼反了
         token_block_attn_weights_sum.reverse()
         history_scores.reverse()
 
