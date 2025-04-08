@@ -15,6 +15,7 @@ from rouge import Rouge
 import logging
 import numpy as np
 import pdb
+import patch_llama_model_forward
 from eval import (
     scorer
 )
@@ -258,7 +259,7 @@ def eval_task(model, tokenizer,args, task_type="xsum"):
         batch_outputs =tokenizer.batch_decode(output[0][:,context_length:].tolist(),
                                             skip_special_tokens=True)
         batch_generations = batch_outputs
-        print(batch_generations)
+        # print(batch_generations)
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         for j in range(len(batch_generations)):

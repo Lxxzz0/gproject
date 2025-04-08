@@ -18,12 +18,14 @@ from transformers.models.llama.modeling_llama import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
     LlamaForCausalLM,
+    LlamaModel,
 )
 import types
 
 __all__ = ["H2OLlamaForCausalLM", "H2OLlamaAttention",
             'H2OLlamaAttention_streaming', 'H2OLlamaForCausalLM_streaming']
 
+_original_forward = LlamaModel.forward
 
 from transformers.configuration_utils import PretrainedConfig
 
@@ -281,7 +283,7 @@ class LXSNAPKVCache_LayerWise:
         self.v_seq_dim = v_seq_dim
         self.hh_score = None
         
-    # 改进的方法是要计算，
+    # 改进的方法是要计算
     def __call__(self, key_states, query_states, value_states, attn_weights, history_score):
         # 计算注意力权重
         bsz, num_heads, seq_len, head_dim = key_states.shape
@@ -357,7 +359,7 @@ class LXSNAPKVCache_LayerWise:
         history_scores = []
 
         # 求 token block 内的 token 在全局范围的的注意力权重
-        for i in range(self.token_block_count):
+        for i in reversed(range(self.token_block_count)):
             token_block_weights = attn_weights[:, :, seq_len - (i + 1) * self.token_block_size: seq_len - i * self.token_block_size, :].sum(dim=-2)  
             # 当前 token block 的注意力权重占总注意力权重的比例
             token_block_ratio = (token_block_weights.sum(dim = -1) / attn_weights_sum)  # 对 seq_len 维度求和，形状为 (batch_size, num_heads)
@@ -367,8 +369,12 @@ class LXSNAPKVCache_LayerWise:
             # token_block_attn_weights_sum.append(token_block_ratio.mean().item())  # 对 batch 和 heads 求平均，得到标量
             token_block_attn_weights_sum.append(token_block_ratio.sum().item())
 
+        # reversed(token_block_attn_weights_sum)
+        token_block_attn_weights_sum.reverse()
+        history_scores.reverse()
+
         # 打包 token block 和重要性比例
-        for i in range(self.token_block_count):
+        for i in reversed(range(self.token_block_count)):
             token_blocks.append(
                 (
                     (
