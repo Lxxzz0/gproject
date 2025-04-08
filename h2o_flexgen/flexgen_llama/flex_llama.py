@@ -17,6 +17,7 @@ from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
 from torch import nn
+from queue import PriorityQueue
 
 from flexgen_llama.compression import CompressionConfig
 from flexgen_llama.llama_config import LlamaConfig, get_llama_config, download_llama_weights
@@ -35,6 +36,17 @@ fix_recursive_import()
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
+
+class past_kv_priority_id_node:
+    def __init__(self, past_kv, id, priority, layer_idx, hh_score):
+        self.past_kvs = past_kv
+        self.id = id
+        self.priority = priority
+        self.layer_idx = layer_idx
+        self.hh_score = hh_score
+
+    def __lt__(self, other):
+        return self.priority > other.priority
 
 
 class TransformerLayer:
@@ -71,8 +83,11 @@ class TransformerLayer:
     def store_cache(self, cache_home, cache_write_buf, i):
         self.attention.store_cache(cache_home, cache_write_buf, i)
 
+    def update_kv(self, kv_cache):
+        pass
+
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
+                cache_write_buf, i, k, priority_past_kv, cut_config):
         if k == self.policy.num_gpu_batches - 1:
             read_buf1, read_buf2 = weight_read_buf.pop()
         else:
@@ -81,6 +96,7 @@ class TransformerLayer:
         self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
                                cache_write_buf, i, k)
         self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
+
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
@@ -223,11 +239,23 @@ class InputEmbed:
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len), np.int64
 
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
+    def update_kv(self, kv_cache):
+        pass
+
+    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k, priority_past_kv, cut_config):
         # 计算词嵌入
         donate = [False] * 3
         h, donate[0] = hidden.val, True
         mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+
+        # 根据初始输入，更新 cut_config
+        seq_len = h.shape[2]
+        hh_size = int(seq_len * cut_config[0])
+        token_block_size = int(seq_len * cut_config[3])
+        token_block_count = int(cut_config[2] / cut_config[3])
+        window_size = token_block_size * token_block_count
+        recent_size = int(cut_config[1] / cut_config[3])
+        cut_config = [hh_size, recent_size, window_size, token_block_size]
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
@@ -294,11 +322,14 @@ class OutputEmbed:
     def store_cache(self, cache_home, cache_write_buf, i):
         pass  # do nothing
 
+    def update_kv(self, kv_cache):
+        pass
+
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
+                cache_write_buf, i, k, priority_past_kv, cut_config):
         donate = [False] * 4
         h, donate[0] = hidden.val, True
 
@@ -531,8 +562,14 @@ class SelfAttention:
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
+    def update_kv(self, kv_cache, cache_write_buf):
+        new_k_cache, new_v_cache, hh_score = kv_cache
+        cache_write_buf.store((new_k_cache, new_v_cache, hh_score))
+
+
+    # 只要注意力模块使用优先队列
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
+                cache_write_buf, i, k, priority_past_kv, cut_config):
         n_head = self.config.n_head
 
         donate = [False] * 16
@@ -552,12 +589,12 @@ class SelfAttention:
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                                             n_head, donate, self.policy.compress_cache, 
                                                             self.policy.comp_cache_config, 
-                                                            input_layernorm, rotary_emb_inv_freq, self.hh_k)
-            cache_write_buf.store((new_k_cache, new_v_cache))
+                                                            input_layernorm, rotary_emb_inv_freq, self.hh_k, priority_past_kv, cut_config)
+            # cache_write_buf.store((new_k_cache, new_v_cache))
         else:
             # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-            (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
+            (k_cache, donate[12]), (v_cache, donate[13]), (hh_score, donate[13]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
                 h, mask, w_q,
                 w_k, w_v, w_out, n_head,
@@ -565,8 +602,8 @@ class SelfAttention:
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 input_layernorm,
                 rotary_emb_inv_freq, 
-                self.hh_k)
-            cache_write_buf.store((new_k_cache, new_v_cache))
+                self.hh_k, priority_past_kv, hh_score, cut_config)
+            # cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
 
@@ -624,11 +661,14 @@ class MLP:
     def store_cache(self, cache_home, cache_write_buf, i):
         pass  # do nothing
 
+    def update_kv(self, kv_cache):
+        pass
+
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
+                cache_write_buf, i, k, priority_past_kv):
         donate = [False] * 9
         h, donate[0] = hidden.val, True
 
@@ -658,6 +698,20 @@ class LlamaLM:
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
         self.position_embeddings = None
+        
+        # 改进相关的设置
+        # 全局优先队列
+        self.priority_past_kv = PriorityQueue()
+        # 超参数
+        self.hh_ratio = config.hh_ratio            # 使用 h2o 方法剪枝的 token 比例 
+        self.recent_ratio = config.recent_ratio    # 要保留的最近 token 比例
+        self.window_ratio = config.window_ratio    # 预选的最近 token 的比例
+        self.token_block_ratio = config.token_block_ratio
+        self.hh_size = 0
+        self.recent_size = 0
+        self.window_size = 0
+        self.token_block_size = 0
+        self.cut_config = [self.hh_ratio, self.recent_ratio, self.window_ratio, self.token_block_ratio]
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
@@ -854,7 +908,7 @@ class LlamaLM:
         # Run layer computation
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
             self.weight_read_buf[j], self.attention_mask[k],
-            self.cache_write_buf[j][k], i, k)
+            self.cache_write_buf[j][k], i, k, self.priority_past_kv, self.cut_config)
 
     def sync(self):
         self.env.disk.synchronize()
@@ -977,6 +1031,7 @@ class LlamaLM:
         return self.output_ids
 
     def generation_loop_normal(self):
+        # 等每层都计算过了再更新 kv cache
         for i in range(self.execute_gen_len):
             timers("generate").start()
             for k in range(self.num_gpu_batches):
@@ -991,6 +1046,38 @@ class LlamaLM:
                     self.compute_layer(i, j, k)
                     self.store_hidden(i, j, k)
                     self.store_cache(i, j, k, overlap=False)
+
+            
+            blasket = [[] for _ in range(self.num_layers)]
+            cur_len = 0
+            while self.priority_past_kv.qsize() > 0 and cur_len < self.recent_size:
+                cur_len += 1
+                node = self.priority_past_kv.get()
+                blasket[node.layer_idx].append(node)
+            
+            # 清空优先队列
+            while self.priority_past_kv.qsize() > 0:
+                self.priority_past_kv.get()
+
+            # 更新 kv cache
+            for i in range(self.num_layers):
+                sorted_list = sorted(blasket[i], key=lambda x: x.id)
+                k_torch_list = []
+                v_torch_list = []
+                hh_list = []
+                tmp_k_past_kv = None
+                tmp_v_past_kv = None
+                tmp_hh_score = None
+                for j in range(len(sorted_list)):
+                    k_torch_list.append(sorted_list[j].past_kvs[0])
+                    v_torch_list.append(sorted_list[j].past_kvs[1])
+                    hh_list.append(sorted_list[j].hh_score)
+                if len(k_torch_list) > 0:
+                    tmp_k_past_kv = torch.cat(k_torch_list, dim=2)
+                    tmp_v_past_kv = torch.cat(v_torch_list, dim=2)
+                    tmp_hh_score = torch.cat(hh_list, dim=-1)
+                self.layers[i].update_kv((tmp_k_past_kv, tmp_v_past_kv, tmp_hh_score))
+
             timers("generate").stop()
 
     def generation_loop_debug_normal(self):

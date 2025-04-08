@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import numpy as np
 from llama_config import LlamaConfig
 from transformers.activations import ACT2FN
+from flex_llama import past_kv_priority_id_node
 
 from flexgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
@@ -465,10 +466,23 @@ class TorchDevice:
         # acc = self.allocate(shape[:-1], np.float16, pin_memory=pin_memory)
         # return k_cache, v_cache, acc
 
+
+    class past_kv_priority_id_node:
+            def __init__(self, past_kv, id, priority, layer_idx, hh_score):
+                self.past_kvs = past_kv
+                self.id = id
+                self.priority = priority
+                self.layer_idx = layer_idx
+                self.hh_score = hh_score
+
+            def __lt__(self, other):
+                return self.priority > other.priority
+
+
     # 注意力层计算（预填充阶段）
     def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, 
                   w_out, n_head, donate, compress_cache, comp_config, 
-                  input_layernorm, rotary_emb_inv_freq, hh_k):
+                  input_layernorm, rotary_emb_inv_freq, hh_k, priority_past_kv, cut_config):
         """Multi-head attention (prefill phase)."""
 
         # decompress weights
@@ -538,7 +552,8 @@ class TorchDevice:
         k = k.permute(2, 0, 1)
         v = v.permute(1, 0, 2)
 
-        k, v = self._heavy_hitter_pruning(k, v, attn_weights, hh_k)
+        # k, v = self._heavy_hitter_pruning(k, v, attn_weights, hh_k)
+        self.snapkv(k, v, attn_weights, hh_k, priority_past_kv, None, cut_config)
 
         if compress_cache:
             k = self.compressed_device.compress(k, comp_config)
@@ -550,10 +565,119 @@ class TorchDevice:
         return TorchTensor.create_from_torch(value, self), k, v
 
 
+    def snapkv(self, key_states, value_states, attn_weights, priority_past_kv, hh_score, cut_config):
+        def update_hh_score(self, attn_score_cache):
+            # 新增的 token 数
+            num_new_tokens = attn_score_cache.shape[2]
+            if self.hh_score is None:
+                # [num_head, seq_len（q的长度）] 
+                self.hh_score = attn_score_cache.sum(0).sum(1)
+            else:
+                # 把分数累加到旧的 token 上
+                attn_score_cache = attn_score_cache.sum(0).sum(1)
+                attn_score_cache[:, :num_new_tokens] += self.hh_score
+                self.hh_score = attn_score_cache
+        # 计算注意力权重
+        bsz, num_heads, seq_len, head_dim = key_states.shape
+        token_blocks = []
+        # 初始化
+        hh_size = cut_config[0]
+        recent_size = cut_config[1]
+        window_size = cut_config[2]
+        token_block_size = cut_config[3]
+        token_block_count = int(window_size / token_block_size)
+        cache_size = hh_size + window_size
+
+        # 解包，获取历史注意力分数
+        history_score = priority_past_kv[2]
+        hh_score = history_score
+        update_hh_score(attn_weights)
+
+        # 直接返回
+        if seq_len <= cache_size:
+            node = past_kv_priority_id_node(
+                (
+                    key_states, 
+                    value_states
+                ), 
+                0,
+                recent_size,
+                hh_score
+            )
+            priority_past_kv.put(node)
+            return
+
+        # 包含 h2o 的方法
+        if hh_size > 0:
+            past_key_values = (key_states, value_states)
+            select_hh_scores = hh_score[:, :seq_len - window_size]
+            _, keep_topk = torch.topk(select_hh_scores, hh_size, dim=-1)
+            keep_topk = keep_topk.sort().values
+
+            mask = torch.zeros(hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
+            mask = mask.scatter(-1, keep_topk, 1)
+
+            k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+            v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+
+            hh_score= hh_score[mask].view(num_heads, -1)
+
+            node = past_kv_priority_id_node(
+                (
+                    k_hh_recent, 
+                    v_hh_recent
+                ), 
+                50000,
+                recent_size,
+                hh_score
+            )
+            priority_past_kv.put(node)
+
+        # window 方法
+        # pdb.set_trace()
+        # 计算注意力权重，这里只计算了滑动窗口内的 token
+
+        # 每个历史 token 在所有查询 token 中的重要性
+        attn_weights_sum = attn_weights.sum(dim = -2).sum(dim = -1)
+        attn_scores = attn_weights.sum(0).sum(1)
+
+        # 选择 token block
+        # pdb.set_trace()
+        token_block_attn_weights_sum = []
+        history_scores = []
+
+        # 求 token block 内的 token 在全局范围的的注意力权重
+        for i in range(token_block_count):
+            token_block_weights = attn_weights[:, :, seq_len - (i + 1) * token_block_size: seq_len - i * token_block_size, :].sum(dim=-2)  
+            
+            # 当前 token block 的注意力权重占总注意力权重的比例
+            token_block_ratio = (token_block_weights.sum(dim = -1) / attn_weights_sum)  # 对 seq_len 维度求和，形状为 (batch_size, num_heads)
+
+            # 计算当前 token block 的历史注意力分数
+            history_scores.append(attn_scores[:, seq_len - (i + 1) * token_block_size: seq_len - i * token_block_size])
+            
+            # 将比例（标量）添加到列表中
+            # token_block_attn_weights_sum.append(token_block_ratio.mean().item())  # 对 batch 和 heads 求平均，得到标量
+            token_block_attn_weights_sum.append(token_block_ratio.sum().item())
+
+        # 打包 token block 和重要性比例
+        for i in range(token_block_count):
+            node = past_kv_priority_id_node(
+                (
+                    key_states[:, :, seq_len - (i + 1) * token_block_size: seq_len - i * token_block_size, :], 
+                    value_states[:, :, seq_len - (i + 1) * token_block_size: seq_len - i * token_block_size, :]
+                ), 
+                token_block_attn_weights_sum[i],
+                recent_size,
+                history_scores[i]
+            )
+            priority_past_kv.put(node)
+
+
     # 中间层计算
     def mha_gen_llama(self, inputs, attention_mask, w_q, w_k, w_v,
                 w_out, n_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, hh_k):
+                attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, hh_k, priority_past_kv, hh_score, cut_config):
         """Multi-head attention (decoding phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -564,6 +688,7 @@ class TorchDevice:
 
         b, tgt_s, h = inputs.shape
         src_s = attention_mask.shape[1]
+        q_len = src_s
         head_dim = h // n_head
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data)
         scaling = head_dim ** -0.5
@@ -639,7 +764,22 @@ class TorchDevice:
 
         value.add_(inputs.data)
 
-        k, v = self._heavy_hitter_pruning(k, v, attn_weights, hh_k)
+        attn_weights = torch.bmm(q, k)
+
+        # 计算掩码
+        # shape: (b, 1, s, s)
+        idx = torch.arange(q_len, device=self.dev)
+        causal_mask = (idx <= idx.view(q_len, 1)).view(1, 1, q_len, q_len)
+        mask = attention_mask.data.view(b, 1, 1, q_len) & causal_mask
+
+        # shape: (b, n_head, s, s)
+        attn_weights = attn_weights.view(b, n_head, q_len, q_len)
+        attn_weights = torch.where(mask, attn_weights, -1e4)
+        attn_weights = attn_weights.view(b * n_head, q_len, q_len)
+        attn_weights = F.softmax(attn_weights, dim=2)
+
+        # k, v = self._heavy_hitter_pruning(k, v, attn_weights, hh_k)
+        self.snapkv(k, v, attn_weights, hh_k, priority_past_kv, hh_score, cut_config)
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()

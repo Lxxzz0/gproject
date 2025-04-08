@@ -258,6 +258,7 @@ def eval_task(model, tokenizer,args, task_type="xsum"):
         batch_outputs =tokenizer.batch_decode(output[0][:,context_length:].tolist(),
                                             skip_special_tokens=True)
         batch_generations = batch_outputs
+        print(batch_generations)
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         for j in range(len(batch_generations)):
@@ -306,6 +307,8 @@ if __name__ == '__main__':
     # 默认是full
     parser.add_argument("--hh_ratio", type=float, default=0)
     parser.add_argument("--recent_ratio", type=float, default=1)
+    parser.add_argument("--window_ratio", type=float, default=0)
+    parser.add_argument("--token_block_ratio", type=float, default=0)
     parser.add_argument("--keep_first", type=int, default=0)
 
     parser.add_argument('--enable_h2o_cache', action='store_true')
@@ -346,6 +349,8 @@ if __name__ == '__main__':
         config.recent_size = args.recent_size
         config.hh_ratio = args.hh_ratio
         config.recent_ratio = args.recent_ratio
+        config.window_ratio = args.window_ratio
+        config.token_block_ratio = args.token_block_ratio
         config.keep_first = args.keep_first
         model = ENABLE_Heavy_Hitter_FUNCTIONS['llama_h2o'].from_pretrained(model_name, config=config,
                                                                             cache_dir=args.cache_dir)

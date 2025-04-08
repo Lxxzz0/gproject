@@ -23,7 +23,9 @@ GPU=$4
 # RECENT_SIZE=$6
 hh_ratio=$5
 recent_ratio=$6
-keep_first=$7
+window_ratio=$7
+token_block_ratio=$8
+keep_first=$9
 
 # --model_name /home/ubuntu/data/models/huggyllama-llama-7b \
 
@@ -35,6 +37,8 @@ if [[ ${method} == 'h2o' ]]; then
         --model_name /home/ubuntu/data/hf_cache/models--huggyllama--llama-7b/snapshots/4782ad278652c7c71b72204d462d6d01eaaf7549 \
         --hh_ratio ${hh_ratio} \
         --recent_ratio ${recent_ratio} \
+        --window_ratio ${window_ratio} \
+        --token_block_ratio ${token_block_ratio} \
         --cache_dir ${HF_CACHE}  \
         --keep_first ${keep_first} \
         --enable_h2o_cache
