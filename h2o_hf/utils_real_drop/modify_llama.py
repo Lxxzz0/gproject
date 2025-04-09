@@ -284,10 +284,11 @@ class LXSNAPKVCache_LayerWise:
         self.hh_score = None
         
     # 改进的方法是要计算
-    def __call__(self, key_states, query_states, value_states, attn_weights, history_score):
+    def __call__(self, key_states, query_states, value_states, attn_weights, tmp_attn_weights, history_score):
         # 计算注意力权重
         bsz, num_heads, seq_len, head_dim = key_states.shape
         token_blocks = []
+        # pdb.set_trace()
         # 解包，获取历史注意力分数
         self.hh_score = history_score
         self._update_hh_score(attn_weights)
@@ -331,12 +332,12 @@ class LXSNAPKVCache_LayerWise:
             # kv缓存的形状是[bsz, num_heads, seq_len, head_dim]
             k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
             v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-            self.hh_score= self.hh_score[mask].view(num_heads, -1)
+            self.hh_score = self.hh_score[mask].view(num_heads, -1)
 
             token_blocks.append(
                 (
                     (
-                        k_hh_recent, 
+                        k_hh_recent,
                         v_hh_recent
                     ), 
                     50000,
@@ -352,6 +353,8 @@ class LXSNAPKVCache_LayerWise:
         # attn_scores = attn_weights[:, :, seq_len - self.window_size:, :].sum(0).sum(1)
         attn_scores = attn_weights.sum(0).sum(1)
         attn_weights_sum = attn_weights.sum(dim = -2).sum(dim = -1)
+        # attn_scores = tmp_attn_weights.sum(0).sum(1)
+        # attn_weights_sum = tmp_attn_weights.sum(dim = -2).sum(dim = -1)
 
         # 选择 token block
         # pdb.set_trace()
@@ -360,18 +363,20 @@ class LXSNAPKVCache_LayerWise:
 
         # 求 token block 内的 token 在全局范围的的注意力权重
         for i in reversed(range(self.token_block_count)):
-            token_block_weights = attn_weights[:, :, seq_len - (i + 1) * self.token_block_size: seq_len - i * self.token_block_size, :].sum(dim=-2)  
+            # token_block_weights = attn_weights[:, :, seq_len - (i + 1) * self.token_block_size: seq_len - i * self.token_block_size, :].sum(dim=-2)  
+            token_block_weights = attn_scores[:, seq_len - (i + 1) * self.token_block_size: seq_len - i * self.token_block_size].sum(dim=-1)
             # 当前 token block 的注意力权重占总注意力权重的比例
-            token_block_ratio = (token_block_weights.sum(dim = -1) / attn_weights_sum)  # 对 seq_len 维度求和，形状为 (batch_size, num_heads)
+            # token_block_ratio = (token_block_weights.sum(dim = -1) / attn_weights_sum)  # 对 seq_len 维度求和，形状为 (batch_size, num_heads)
+            token_block_ratio = (token_block_weights.sum(dim = -1).sum(dim=-1) / attn_scores.sum(dim=-1).sum(dim=-1))  # 对 seq_len 维度求和，形状为 (batch_size, num_heads)
             # 计算当前 token block 的历史注意力分数
             history_scores.append(attn_scores[:, seq_len - (i + 1) * self.token_block_size: seq_len - i * self.token_block_size])
             # 将比例（标量）添加到列表中
-            # token_block_attn_weights_sum.append(token_block_ratio.mean().item())  # 对 batch 和 heads 求平均，得到标量
-            token_block_attn_weights_sum.append(token_block_ratio.sum().item())
+            # token_block_attn_weights_sum.append(token_block_ratio.sum().item())  # 对 batch 和 heads 求平均，得到标量
+            token_block_attn_weights_sum.append(token_block_ratio.item())
 
         # 加了反转，之前都拼反了
-        token_block_attn_weights_sum.reverse()
-        history_scores.reverse()
+        # token_block_attn_weights_sum.reverse()
+        # history_scores.reverse()
 
         # 打包 token block 和重要性比例
         for i in reversed(range(self.token_block_count)):
@@ -757,6 +762,7 @@ class H2OLlamaAttention(nn.Module):
 
         # upcast attention to fp32
         # 先计算得到注意力分数
+        tmp_attn_weight = attn_weights.detach().clone()
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         # # 对第二个维度求和，绘制出来
         # sum_attn_weights = torch.sum(attn_weights, dim=1)
@@ -764,7 +770,8 @@ class H2OLlamaAttention(nn.Module):
         # plot_and_save_matrix(sum_attn_weights[0], self.layer_idx, "attn_weights.png", "Attention Weights")
 
         # past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
-        past_key_value = self.lx_snapkv_cache(key_states, query_states, value_states, attn_weights.detach().clone(), past_key_value[2])
+        # past_key_value = self.lx_snapkv_cache(key_states, query_states, value_states, attn_weights.detach().clone(), past_key_value[2])
+        past_key_value = self.lx_snapkv_cache(key_states, query_states, value_states, attn_weights.detach().clone(), tmp_attn_weight, past_key_value[2])
 
         attn_output = torch.matmul(attn_weights, value_states)
 

@@ -28,16 +28,16 @@
 
 
 # h2o
-bash ./scripts/summarization/eval.sh narrativeqa 0 h2o 5 0.1 0.2 0.4 0.1 0
+# bash ./scripts/summarization/eval.sh narrativeqa 0 h2o 5 0.1 0.2 0.4 0.1 0
 # bash ./scripts/summarization/eval.sh qasper 0 h2o 5 0.1 0.2 0.4 0.1 0
-# bash ./scripts/summarization/eval.sh xsum 0 h2o 5 0.1 0.2 0.4 0.1 0
-# bash ./scripts/summarization/eval.sh multifieldqa_en 0 h2o 5 0.1 0.2 0.4 0.1 0
-# bash ./scripts/summarization/eval.sh hotpotqa 0 h2o 5 0.1 0.2 0.4 0.1 0
-# bash ./scripts/summarization/eval.sh 2wikimqa 0 h2o 5 0.1 0.2 0.4 0.1 0
-# bash ./scripts/summarization/eval.sh musique 0 h2o 5 0.1 0.2 0.4 0.1 0
-# bash ./scripts/summarization/eval.sh gov_report 0 h2o 5 0.1 0.2 0.4 0.1 0
-# bash ./scripts/summarization/eval.sh multi_news 0 h2o 5 0.1 0.2 0.4 0.1 0
-# bash ./scripts/summarization/eval.sh triviaqa 0 h2o 5 0.1 0.2 0.4 0.1 0
+bash ./scripts/summarization/eval.sh xsum 0 h2o 5 0.1 0.2 0.4 0.1 0
+bash ./scripts/summarization/eval.sh multifieldqa_en 0 h2o 5 0.1 0.2 0.4 0.1 0
+bash ./scripts/summarization/eval.sh hotpotqa 0 h2o 5 0.1 0.2 0.4 0.1 0
+bash ./scripts/summarization/eval.sh 2wikimqa 0 h2o 5 0.1 0.2 0.4 0.1 0
+bash ./scripts/summarization/eval.sh musique 0 h2o 5 0.1 0.2 0.4 0.1 0
+bash ./scripts/summarization/eval.sh gov_report 0 h2o 5 0.1 0.2 0.4 0.1 0
+bash ./scripts/summarization/eval.sh multi_news 0 h2o 5 0.1 0.2 0.4 0.1 0
+bash ./scripts/summarization/eval.sh triviaqa 0 h2o 5 0.1 0.2 0.4 0.1 0
 
 # 原本的h2o方法
 # bash ./scripts/summarization/eval.sh narrativeqa 0 h2o 5 0.1 0.1 0.4 0.1 0
