@@ -29,12 +29,13 @@ keep_first=$9
 
 # --model_name /home/ubuntu/data/models/huggyllama-llama-7b \
 
-if [[ ${method} == 'h2o' ]]; then
+if [[ ${method} == 'h2o' || ${method} == 'lx' ]]; then
     CUDA_VISIBLE_DEVICES=${GPU} python -u run_summarization.py \
         --dataset ${task} \
+        --method ${method} \
         --input_path data/summarization_data/${task}_${shots}shot.jsonl \
         --output_path summary_results/${task}_${shots}shot_h2o_hh${1}_${2}.jsonl \
-        --model_name /home/ubuntu/data/hf_cache/models--huggyllama--llama-7b/snapshots/4782ad278652c7c71b72204d462d6d01eaaf7549 \
+        --model_name /home/ubuntu/data/models/huggyllama-llama-7b \
         --hh_ratio ${hh_ratio} \
         --recent_ratio ${recent_ratio} \
         --window_ratio ${window_ratio} \

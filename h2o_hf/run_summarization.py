@@ -1,7 +1,7 @@
 import argparse
 import json
 import os.path
-
+import types
 import tqdm
 import torch
 import copy
@@ -15,7 +15,6 @@ from rouge import Rouge
 import logging
 import numpy as np
 import pdb
-import patch_llama_model_forward
 from eval import (
     scorer
 )
@@ -297,6 +296,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--input_path", type=str, default="")
     parser.add_argument("--dataset", type=str, default="xsum")
+    parser.add_argument("--method", type=str, default="h2o")
     parser.add_argument("--output_path", type=str, default="")
 
     parser.add_argument("--model_name", type=str, default="")
@@ -346,6 +346,8 @@ if __name__ == '__main__':
 
     if args.enable_h2o_cache:
         print('Enabling H2O KV cache')
+        # 指定具体使用什么方法
+        config.method = args.method
         config.hh_size = args.hh_size
         config.recent_size = args.recent_size
         config.hh_ratio = args.hh_ratio
@@ -357,6 +359,11 @@ if __name__ == '__main__':
                                                                             cache_dir=args.cache_dir)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=args.cache_dir)
+    if config.method == "lx":
+        from patch_llama_model_forward import _patched_forward
+        # 将 _patched_forward 绑定到 model.model 实例
+        model.model.forward = types.MethodType(_patched_forward, model.model)
+
 
     model.half().eval().cuda()
     # 获取数据集
@@ -364,11 +371,12 @@ if __name__ == '__main__':
         args.data_file = args.input_path
     else:
         args.data_file = f"data/LongBench/{args.dataset}.jsonl"
-    args.method = "h2o"
+    # args.method = "h2o"
 
     # 评估
     eval_task(model, tokenizer, args, task_type=args.dataset)
 
 # 使用方法参考
 # bash scripts/summarization/eval.sh xsum 3 h2o 5 0.1 0.1 0
-# bash scripts/summarization/eval.sh xsum 3 narrativeqa 5 0.1 0.1 0
+# bash scripts/summarization/eval.sh xsum 3 h2o 5 0.1 0.1 0
+# bash scripts/summarization/eval.sh triviaqa 3 h2o 5 0.1 0.1 0

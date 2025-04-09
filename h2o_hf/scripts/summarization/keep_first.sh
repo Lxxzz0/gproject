@@ -51,6 +51,7 @@ bash ./scripts/summarization/eval.sh triviaqa 0 h2o 5 0.1 0.2 0.4 0.1 0
 # bash ./scripts/summarization/eval.sh multi_news 0 h2o 5 0.1 0.1 0.4 0.1 0
 # bash ./scripts/summarization/eval.sh triviaqa 0 h2o 5 0.1 0.1 0.4 0.1 0
 
+# bash ./scripts/summarization/eval.sh triviaqa 0 lx 5 0.1 0.1 0.4 0.1 0
 
 
 # narrativeqa
