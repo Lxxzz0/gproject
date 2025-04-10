@@ -264,7 +264,8 @@ def _patched_forward(
     # 优先队列
     past_kv_priority_queue = PriorityQueue()
     id = 0
-
+    # 记录最近的kv cache
+    past_kv_windows = [[] for _ in range(len(self.layers))]
     # pdb.set_trace()
 
     for idx, decoder_layer in enumerate(self.layers):
@@ -305,7 +306,8 @@ def _patched_forward(
             # 改动，返回的是多组 token 的 KV Cache 的列表
             token_block_queue_num = past_kv_priority_queue.qsize()
             token_block_list_num = len(layer_outputs[1])
-            for ii in range(token_block_list_num):
+            past_kv_windows[idx] = layer_outputs[1][0][0]
+            for ii in range(1,token_block_list_num):
                 id = token_block_queue_num + ii
                 self.recent_size = layer_outputs[1][ii][2]
                 past_kv_priority_queue.put(
@@ -327,7 +329,7 @@ def _patched_forward(
     if output_hidden_states:
         all_hidden_states += (hidden_states,)
 
-    # pdb.set_trace()
+    # import pdb; pdb.set_trace()
     # 在这里改动，更新 KV Cache 的优先队列
     # 确定队列长度
     kvcache_len = len(self.layers) * self.recent_size
@@ -335,7 +337,8 @@ def _patched_forward(
     cur_len = 0
     while not past_kv_priority_queue.empty() and cur_len < kvcache_len:
         node = past_kv_priority_queue.get()
-        cur_len += 1
+        # cur_len += 1
+        cur_len += node.past_kvs[0].shape[2]
         blasket[node.layer_idx].append(node)
 
     # 记得清空队列
@@ -356,10 +359,13 @@ def _patched_forward(
             k_torch_list.append(sorted_list[j].past_kvs[0])
             v_torch_list.append(sorted_list[j].past_kvs[1])
             hh_list.append(sorted_list[j].hh_score)
+        k_torch_list.append(past_kv_windows[i][0])
+        v_torch_list.append(past_kv_windows[i][1])
         if len(k_torch_list) > 0:
             tmp_k_past_kv = torch.cat(k_torch_list, dim=2)
             tmp_v_past_kv = torch.cat(v_torch_list, dim=2)
-            tmp_hh_score = torch.cat(hh_list, dim=-1)
+            if len(hh_list) > 0:
+                tmp_hh_score = torch.cat(hh_list, dim=-1)
         if tmp_k_past_kv is None:
             next_decoder_cache += (None,)
         else:

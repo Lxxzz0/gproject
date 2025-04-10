@@ -315,88 +315,65 @@ class LXSNAPKVCache_LayerWise:
             )
             return token_blocks    # 表示没进行剪枝
 
+
         # 初始化
         if self.recent_size == 0:
             self.hh_size = int(seq_len * self.hh_ratio)
             # self.token_block_size = int(seq_len * self.token_block_ratio)
             # ceil div (hh_size, token_block_size)
-            self.token_block_size = 64
-            self.token_block_count = int((seq_len-self.recent_size+ self.token_block_size-1) / self.token_block_size)
-            self.window_size = int(seq_len*self.window_ratio)
+            self.token_block_size = 4
+            self.window_size = int(seq_len * self.window_ratio)
             self.cache_size = self.hh_size + self.window_size
+            self.token_block_count = int((seq_len-self.cache_size+ self.token_block_size-1) / self.token_block_size)
             self.recent_size = self.cache_size
 
-        # 包含 h2o 的方法
-        if self.hh_size > 0:
-            past_key_values = (key_states, value_states)
-            # 在滑动窗口前选择 hh_size 个 token
-            select_hh_scores = self.hh_score[:, :seq_len - self.window_size]
-            # select_hh_scores = self.hh_score[:, :seq_len - self.recent_size * self.token_block_size]
-            _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
-            keep_topk = keep_topk.sort().values
+        # 约定 token_blocks[0]代表不进行驱除的部分，表示在cache szie 以内或者 是window size
 
-            mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
-            mask = mask.scatter(-1, keep_topk, 1)
-
-            # kv缓存的形状是[bsz, num_heads, seq_len, head_dim]
-            k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-            v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
-            self.hh_score = self.hh_score[mask].view(num_heads, -1)
-
-            token_blocks.append(
+        token_blocks.append(
                 (
                     (
-                        k_hh_recent,
-                        v_hh_recent
+                        key_states[:, :, -self.window_size: , :], 
+                        value_states[:, :, -self.window_size: , :]
                     ), 
-                    50000,
-                    self.recent_size,
-                    self.hh_score
+                    50000.0,
+                    self.hh_size,
+                    None
                 )
             )
-
-        # pdb.set_trace()
-        # 计算注意力权重，这里只计算了滑动窗口内的 token
-
-        # 每个历史 token 在所有查询 token 中的重要性
-        # attn_scores = attn_weights[:, :, seq_len - self.window_size:, :].sum(0).sum(1)
-        attn_scores = attn_score_cache.sum(-2)
-        attn_weights_sum = attn_score_cache.sum(dim = -2).sum(dim = -1)
-        # attn_scores = tmp_attn_weights.sum(0).sum(1)
-        # attn_weights_sum = tmp_attn_weights.sum(dim = -2).sum(dim = -1)
-
+        #  使用 h2o中的累积注意力
+        attn_scores = self.hh_score[:, :- self.window_size]
         # 选择 token block
         # pdb.set_trace()
         token_block_attn_weights_sum = []
         history_scores = []
         # import pdb; pdb.set_trace()
-        for i in range(self.token_block_count-1,-1,-1):
+        for i in range(self.token_block_count):
             # 计算当前 token block 的起始和结束索引
-            start_idx = seq_len - (i + 1) * self.token_block_size
-            end_idx = seq_len - i * self.token_block_size
-
+            start_idx = i * self.token_block_size
+            # 注意极限
+            end_idx = min((i+1) * self.token_block_size,attn_scores.shape[1])
+            if start_idx>=end_idx:
+                continue
+            if start_idx<0: break
             # 提取当前 token block 的注意力分数
-            token_block_attention_weights = attn_scores[
-                :, 
-                :, 
-                start_idx: end_idx
-            ].sum(dim=-1)  # 形状：(batch_size, num_heads)
-
-            # 计算当前 token block 的注意力权重比例
-            attention_ratio_per_block = token_block_attention_weights.sum(dim=-1)
-            # attention_ratio_per_block = (
-            #     token_block_attention_weights.sum(dim=-1) / 
-            #     attn_scores.sum(dim=-1).sum(dim=-1)
-            # )  # 形状：(batch_size,)
-
+            sliced = attn_scores[ :, start_idx:end_idx]
+            # 检查切片后的维度大小
+            if sliced.size(1) == 0:
+                # 处理空切片的情况
+                attention_ratio_per_block = torch.zeros(0, device=sliced.device)
+            else:
+                max_over_last_dim = torch.mean(sliced, dim=1)  # 沿着最后一个维度取最大值
+                attention_ratio_per_block = torch.mean(max_over_last_dim, dim=0)  # 沿着第二个维度取最大值
+            # import pdb; pdb.set_trace()
             # 验证并存储比例
             if attention_ratio_per_block.numel() == 1:
                 token_block_attn_weights_sum.append(attention_ratio_per_block.item())
             else:
+                import pdb; pdb.set_trace()
                 raise ValueError("Attention ratio is not a scalar!")
 
             # 存储历史注意力分数
-            history_scores.append(attn_scores[:, :, start_idx: end_idx].sum(0))
+            history_scores.append(attn_scores[ :, start_idx: end_idx].sum(0))
 
             # 打包当前 token block 的 key、value 状态和相关信息
             token_blocks.append(
@@ -406,7 +383,7 @@ class LXSNAPKVCache_LayerWise:
                         value_states[:, :, start_idx: end_idx, :]
                     ), 
                     attention_ratio_per_block,
-                    self.recent_size,
+                    self.hh_size,
                     history_scores[-1]
                 )
             )
